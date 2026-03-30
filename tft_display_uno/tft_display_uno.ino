@@ -1336,8 +1336,8 @@ void setup() {
   curLine[0] = '\0';
   rowCount = 0;
 
-  paintRowAt(0, "TFT Serial terminal", ILI9341_GREEN);
-  histPush("TFT Serial terminal");
+  paintRowAt(0, "UNO Terminal", ILI9341_GREEN);
+  histPush("UNO Terminal");
   paintRowAt(1, "115200 baud", ILI9341_GREEN);
   histPush("115200 baud");
   {
