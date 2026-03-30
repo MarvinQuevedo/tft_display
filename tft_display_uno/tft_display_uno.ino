@@ -669,6 +669,41 @@ static bool parseTwoLongs(const char* p, long* a, long* b) {
   return *q == '\0';
 }
 
+/** Como parseTwoLongs(), pero:
+ *  - no requiere que termine la línea
+ *  - devuelve el puntero donde queda tras ')'
+ *  - permite que el llamador valide el resto (por ejemplo, que sea '\0')
+ */
+static bool parseTwoLongsAndAdvance(const char* p, const char** outEnd, long* a, long* b) {
+  const char* q = p;
+  skipWs(&q);
+  if (*q != '(') {
+    return false;
+  }
+  q++;
+  skipWs(&q);
+  if (!parseValueToken(&q, a)) {
+    return false;
+  }
+  skipWs(&q);
+  if (*q != ',') {
+    return false;
+  }
+  q++;
+  skipWs(&q);
+  if (!parseValueToken(&q, b)) {
+    return false;
+  }
+  skipWs(&q);
+  if (*q != ')') {
+    return false;
+  }
+  q++;
+  skipWs(&q);
+  *outEnd = q;
+  return true;
+}
+
 /** Si la línea actual es un comando BASIC, lo ejecuta y devuelve true (no texto normal). */
 static bool tryBasicCommand() {
   curLine[curLen] = '\0';
@@ -940,15 +975,80 @@ static bool tryBasicCommand() {
         q++; // '='
         if (numericTarget) {
           long val = 0;
-          if (!parseValueToken(&q, &val)) {
-            commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
-            return true;
-          }
+          long a = 0;
+          long b = 0;
+
           skipWs(&q);
-          if (*q != '\0') {
-            commitErrorText("syntax: assignment");
-            return true;
+          // Permite RHS: sum(a,b), mul(a,b), sub(a,b), div(a,b)
+          if (keywordAt(q, "sum")) {
+            const char* end = nullptr;
+            q += 3; // "sum"
+            if (!parseTwoLongsAndAdvance(q, &end, &a, &b)) {
+              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              return true;
+            }
+            if (*end != '\0') {
+              commitErrorText("syntax: assignment");
+              return true;
+            }
+            val = a + b;
+            q = end;
+          } else if (keywordAt(q, "mul")) {
+            const char* end = nullptr;
+            q += 3; // "mul"
+            if (!parseTwoLongsAndAdvance(q, &end, &a, &b)) {
+              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              return true;
+            }
+            if (*end != '\0') {
+              commitErrorText("syntax: assignment");
+              return true;
+            }
+            val = a * b;
+            q = end;
+          } else if (keywordAt(q, "sub")) {
+            const char* end = nullptr;
+            q += 3; // "sub"
+            if (!parseTwoLongsAndAdvance(q, &end, &a, &b)) {
+              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              return true;
+            }
+            if (*end != '\0') {
+              commitErrorText("syntax: assignment");
+              return true;
+            }
+            val = a - b;
+            q = end;
+          } else if (keywordAt(q, "div")) {
+            const char* end = nullptr;
+            q += 3; // "div"
+            if (!parseTwoLongsAndAdvance(q, &end, &a, &b)) {
+              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              return true;
+            }
+            if (*end != '\0') {
+              commitErrorText("syntax: assignment");
+              return true;
+            }
+            if (b == 0) {
+              commitErrorText("division by zero");
+              return true;
+            }
+            val = a / b;
+            q = end;
+          } else {
+            // RHS simple: número literal o VAR
+            if (!parseValueToken(&q, &val)) {
+              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              return true;
+            }
+            skipWs(&q);
+            if (*q != '\0') {
+              commitErrorText("syntax: assignment");
+              return true;
+            }
           }
+
           varsMask |= (1UL << idxNum);
           vars[idxNum] = val;
           snprintf(out, sizeof(out), "%ld", val);
