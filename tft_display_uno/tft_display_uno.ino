@@ -104,11 +104,21 @@ static uint16_t bcStrPoolUsed = 0;
 static const int EEPROM_ADDR_BASE = 0;
 static const uint8_t EEPROM_MAGIC0 = 'B';
 static const uint8_t EEPROM_MAGIC1 = 'C';
-static const uint8_t EEPROM_VER = 1;
+static const uint8_t EEPROM_VER = 2;
+/** Cabecera: v1 = 4 B (sin autorun); v2 = 6 B (+ autorun on/off + índice programa). */
+static const uint8_t EEPROM_VER_MIN = 1;
 static const uint8_t EEPROM_REC_START = 0xA5;
 static const uint8_t EEPROM_REC_END = 0x5A;
 static const uint8_t ARG_TYPE_STRING = 0x20; // bit5 = string
 static const uint8_t ARG_LEN_CODE_1B = 0x00; // bits7..6
+
+static uint8_t eepromLayoutVer = 0;
+static uint8_t eepromAutorunEnable = 0;
+static uint8_t eepromAutorunIndex = 0;
+
+static int eepromHeaderBytes(uint8_t fileVer) {
+  return (fileVer == 2) ? 6 : 4;
+}
 
 #define CMD_DECL(name, text) \
   static const char name[] PROGMEM = text; \
@@ -127,6 +137,8 @@ CMD_DECL(CMD_IN, "in");
 CMD_DECL(CMD_HIGH, "high");
 CMD_DECL(CMD_LOW, "low");
 CMD_DECL(CMD_SLEEP, "sleep");
+CMD_DECL(CMD_SLEEP100, "sleep100");
+CMD_DECL(CMD_SLEEPS, "sleeps");
 CMD_DECL(CMD_GOTO, "goto");
 CMD_DECL(CMD_NOP, "nop");
 CMD_DECL(CMD_END, "end");
@@ -145,6 +157,9 @@ CMD_DECL(CMD_BCLIST, "bclist");
 CMD_DECL(CMD_BCDUMP, "bcdump");
 CMD_DECL(CMD_PLIST, "plist");
 CMD_DECL(CMD_EPERASE, "eperase");
+CMD_DECL(CMD_AUTORUN, "autorun");
+CMD_DECL(CMD_OFF, "off");
+CMD_DECL(CMD_ON, "on");
 CMD_DECL(CMD_LET, "let");
 
 MSG_DECL(MSG_VM_BAD_PARAMS, "vm bad params");
@@ -206,7 +221,11 @@ MSG_DECL(MSG_OK, "ok");
 MSG_DECL(MSG_HIGH_TXT, "HIGH");
 MSG_DECL(MSG_LOW_TXT, "LOW");
 MSG_DECL(MSG_BYTECODE_READY, "bytecode ready");
-MSG_DECL(MSG_CMDS_HELP, "cmds: bcsave bclist bcdump run load");
+MSG_DECL(MSG_AUTORUN_SET, "autorun saved");
+MSG_DECL(MSG_AUTORUN_BAD_INDEX, "autorun: bad program index");
+MSG_DECL(MSG_AUTORUN_FAIL, "autorun save failed");
+MSG_DECL(MSG_SYNTAX_AUTORUN, "syntax: autorun | autorun off | autorun on [n]");
+MSG_DECL(MSG_CMDS_HELP, "cmds: bcsave bclist bcdump run load autorun");
 MSG_DECL(MSG_SYNTAX_SUM, "syntax: sum");
 MSG_DECL(MSG_SYNTAX_MUL, "syntax: mul");
 MSG_DECL(MSG_SYNTAX_SUB, "syntax: sub");
@@ -626,7 +645,8 @@ static bool lineMaybeBasicCommand(void) {
       || keywordAtP(p, CMD_BCSTR, CMD_BCSTR_LEN) || keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)
       || keywordAtP(p, CMD_BCSAVE, CMD_BCSAVE_LEN) || keywordAtP(p, CMD_BCLIST, CMD_BCLIST_LEN)
       || keywordAtP(p, CMD_BCDUMP, CMD_BCDUMP_LEN) || keywordAtP(p, CMD_PLIST, CMD_PLIST_LEN)
-      || keywordAtP(p, CMD_EPERASE, CMD_EPERASE_LEN)) {
+      || keywordAtP(p, CMD_EPERASE, CMD_EPERASE_LEN)
+      || keywordAtP(p, CMD_AUTORUN, CMD_AUTORUN_LEN)) {
     return true;
   }
 
@@ -669,7 +689,8 @@ static bool isKnownCmdWord(const char* w) {
          || strcmp_P(w, CMD_BCSTR) == 0 || strcmp_P(w, CMD_BCCLR) == 0
          || strcmp_P(w, CMD_BCSAVE) == 0 || strcmp_P(w, CMD_BCLIST) == 0 || strcmp_P(w, CMD_BCDUMP) == 0
          || strcmp_P(w, CMD_PLIST) == 0
-         || strcmp_P(w, CMD_EPERASE) == 0;
+         || strcmp_P(w, CMD_EPERASE) == 0
+         || strcmp_P(w, CMD_AUTORUN) == 0;
 }
 
 static bool isTftReservedPin(uint8_t pin) {
@@ -919,7 +940,8 @@ enum : uint8_t {
   OP_NOP = 0,
   OP_HIGH = 1,
   OP_LOW = 2,
-  OP_SLEEP = 3, // arg: milliseconds (0–63, 6-bit field)
+  // OP_SLEEP + PT_NUM6: ms 0–511 | + PT_STRID: arg×100 ms (0–6300) | + PT_NONE: arg s (0–63)
+  OP_SLEEP = 3,
   OP_GOTO = 4,  // arg is instruction index
   OP_PRINT = 5, // print line (flush)
   OP_END = 6,
@@ -933,16 +955,31 @@ enum : uint8_t {
 };
 
 // Bit layout (16-bit instruction):
-// [15..13] reserved
+// [15..13] OP_SLEEP high bits of ms (else 0)
 // [12..11] p0 type
 // [10..9 ] param count
 // [8 ..6 ] opcode
-// [5 ..0 ] arg0
+// [5 ..0 ] arg0 low 6 bits (OP_SLEEP: low 6 bits of ms)
 static uint16_t bcPack(uint8_t op, uint8_t pCount, uint8_t p0Type, uint8_t arg) {
   return (uint16_t)(((uint16_t)(p0Type & 0x03) << 11)
                     | ((uint16_t)(pCount & 0x03) << 9)
                     | ((uint16_t)(op & 0x07) << 6)
                     | (uint16_t)(arg & 0x3F));
+}
+
+/** OP_SLEEP: ms 0–511; upper 3 bits in [15..13], lower 6 in [5..0]. */
+static uint16_t bcPackSleepMs(uint16_t ms) {
+  if (ms > 511) {
+    ms = 511;
+  }
+  uint8_t low = (uint8_t)(ms & 0x3F);
+  uint8_t hi = (uint8_t)((ms >> 6) & 0x07);
+  uint16_t w = bcPack(OP_SLEEP, 1, PT_NUM6, low);
+  return (uint16_t)(w | ((uint16_t)hi << 13));
+}
+
+static uint16_t bcSleepMsFromWord(uint16_t w) {
+  return (uint16_t)((((uint16_t)(w >> 13) & 0x07) << 6) | ((uint16_t)(w & 0x3F)));
 }
 
 static uint8_t bcOp(uint16_t w) {
@@ -967,6 +1004,8 @@ static void eepromInitContainer() {
   EEPROM.update(addr++, EEPROM_MAGIC1);
   EEPROM.update(addr++, EEPROM_VER);
   EEPROM.update(addr++, 0); // number of programs
+  EEPROM.update(addr++, 0); // autorun off
+  EEPROM.update(addr++, 0); // autorun program index
 }
 
 static void bcStringReset() {
@@ -1009,12 +1048,21 @@ static bool eepromScanMeta(uint8_t* outCount, int* outEndAddr) {
   if (EEPROM.read(addr++) != EEPROM_MAGIC0 || EEPROM.read(addr++) != EEPROM_MAGIC1) {
     return false;
   }
-  if (EEPROM.read(addr++) != EEPROM_VER) {
+  uint8_t fileVer = EEPROM.read(addr++);
+  if (fileVer != EEPROM_VER_MIN && fileVer != EEPROM_VER) {
     return false;
   }
+  eepromLayoutVer = fileVer;
   uint8_t count = EEPROM.read(addr++);
   if (count > 31) {
     return false;
+  }
+  if (fileVer == 2) {
+    eepromAutorunEnable = EEPROM.read(addr++);
+    eepromAutorunIndex = EEPROM.read(addr++);
+  } else {
+    eepromAutorunEnable = 0;
+    eepromAutorunIndex = 0;
   }
 
   int eelen = EEPROM.length();
@@ -1058,6 +1106,53 @@ static bool eepromScanMeta(uint8_t* outCount, int* outEndAddr) {
   }
   *outCount = count;
   *outEndAddr = addr;
+  return true;
+}
+
+/** v1→v2: inserta 2 bytes de autorun tras el contador; desplaza registros. */
+static bool eepromMigrateV1ToV2(void) {
+  uint8_t count = 0;
+  int endAddr = 0;
+  if (!eepromScanMeta(&count, &endAddr)) {
+    return false;
+  }
+  if (eepromLayoutVer != 1) {
+    return true;
+  }
+  int usedLen = endAddr - 4;
+  if (usedLen < 0 || 6 + usedLen > EEPROM.length()) {
+    return false;
+  }
+  for (int i = usedLen - 1; i >= 0; i--) {
+    EEPROM.update(6 + i, EEPROM.read(4 + i));
+  }
+  EEPROM.update(2, EEPROM_VER);
+  EEPROM.update(4, 0);
+  EEPROM.update(5, 0);
+  eepromLayoutVer = EEPROM_VER;
+  eepromAutorunEnable = 0;
+  eepromAutorunIndex = 0;
+  return true;
+}
+
+static bool eepromWriteAutorun(uint8_t enable, uint8_t progIdx) {
+  if (!eepromMigrateV1ToV2()) {
+    return false;
+  }
+  uint8_t count = 0;
+  int endAddr = 0;
+  if (!eepromScanMeta(&count, &endAddr)) {
+    return false;
+  }
+  if (enable) {
+    if (count == 0 || progIdx >= count) {
+      return false;
+    }
+  }
+  EEPROM.update(EEPROM_ADDR_BASE + 4, enable ? 1 : 0);
+  EEPROM.update(EEPROM_ADDR_BASE + 5, progIdx);
+  eepromAutorunEnable = enable ? 1 : 0;
+  eepromAutorunIndex = progIdx;
   return true;
 }
 
@@ -1159,7 +1254,7 @@ static bool loadBCFromEEPROMIndex(uint8_t wantedIndex) {
     return false;
   }
 
-  addr = EEPROM_ADDR_BASE + 4;
+  addr = EEPROM_ADDR_BASE + eepromHeaderBytes(eepromLayoutVer);
   for (uint8_t i = 0; i < count; i++) {
     if (EEPROM.read(addr++) != EEPROM_REC_START) {
       return false;
@@ -1287,13 +1382,22 @@ static void vmStep() {
       vmPC++;
       break;
     case OP_SLEEP:
-      if (pCount != 1 || pType != PT_NUM6) {
+      if (pCount != 1) {
         vmStop();
         commitErrorText_P(MSG_VM_BAD_PARAMS);
         break;
       }
       vmPC++;
-      vmWaitUntilMs = now + (uint32_t)arg;
+      if (pType == PT_NUM6) {
+        vmWaitUntilMs = now + (uint32_t)bcSleepMsFromWord(ins);
+      } else if (pType == PT_STRID) {
+        vmWaitUntilMs = now + (uint32_t)arg * 100UL;
+      } else if (pType == PT_NONE) {
+        vmWaitUntilMs = now + (uint32_t)arg * 1000UL;
+      } else {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+      }
       break;
     case OP_GOTO:
       if (pCount != 1 || pType != PT_NUM6) {
@@ -1397,6 +1501,9 @@ static void vmStep() {
   }
 }
 
+/** 0=sleep(ms), 1=sleep100, 2=sleeps; solo para parseBcOpToken → bc(sleep…) */
+static uint8_t bcSleepParseKind = 0;
+
 static bool parseOptionalIndex(const char* p, bool* hasArg, uint8_t* outIdx) {
   const char* q = p;
   skipWs(&q);
@@ -1431,6 +1538,7 @@ static bool parseOptionalIndex(const char* p, bool* hasArg, uint8_t* outIdx) {
 }
 
 static bool parseBcOpToken(const char** pp, uint8_t* outOp) {
+  bcSleepParseKind = 0;
   const char* p = *pp;
   skipWs(&p);
   if (*p == '\0') {
@@ -1467,8 +1575,15 @@ static bool parseBcOpToken(const char** pp, uint8_t* outOp) {
     *outOp = OP_HIGH;
   } else if (strcmp_P(w, CMD_LOW) == 0) {
     *outOp = OP_LOW;
+  } else if (strcmp_P(w, CMD_SLEEP100) == 0) {
+    *outOp = OP_SLEEP;
+    bcSleepParseKind = 1;
+  } else if (strcmp_P(w, CMD_SLEEPS) == 0) {
+    *outOp = OP_SLEEP;
+    bcSleepParseKind = 2;
   } else if (strcmp_P(w, CMD_SLEEP) == 0) {
     *outOp = OP_SLEEP;
+    bcSleepParseKind = 0;
   } else if (strcmp_P(w, CMD_GOTO) == 0) {
     *outOp = OP_GOTO;
   } else if (strcmp_P(w, CMD_PRINT) == 0 || strcmp_P(w, CMD_END) == 0) {
@@ -1532,6 +1647,80 @@ static bool tryBasicCommand() {
     progNeedsSave = false;
     bcStringReset();
     commitGreenText_P(MSG_BC_CLEARED);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_AUTORUN, CMD_AUTORUN_LEN)) {
+    p += CMD_AUTORUN_LEN;
+    skipWs(&p);
+    if (*p == '\0') {
+      uint8_t c = 0;
+      int e = 0;
+      if (!eepromScanMeta(&c, &e)) {
+        commitGreenText_P(MSG_AUTORUN_FAIL);
+        return true;
+      }
+      strcpy(out, "autorun ");
+      if (eepromAutorunEnable) {
+        strcat(out, "on p#");
+        catU32(out, (uint32_t)eepromAutorunIndex);
+      } else {
+        strcat(out, "off");
+      }
+      commitGreenText(out);
+      return true;
+    }
+    if (keywordAtP(p, CMD_OFF, CMD_OFF_LEN)) {
+      p += CMD_OFF_LEN;
+      skipWs(&p);
+      if (*p != '\0') {
+        commitErrorText_P(MSG_SYNTAX_AUTORUN);
+        return true;
+      }
+      if (!eepromWriteAutorun(0, 0)) {
+        commitErrorText_P(MSG_AUTORUN_FAIL);
+        return true;
+      }
+      commitGreenText_P(MSG_AUTORUN_SET);
+      return true;
+    }
+    if (keywordAtP(p, CMD_ON, CMD_ON_LEN)) {
+      p += CMD_ON_LEN;
+      skipWs(&p);
+      uint8_t idx = 0;
+      if (*p != '\0') {
+        char* end = nullptr;
+        long v = strtol(p, &end, 10);
+        if (end == p || v < 0 || v > 31) {
+          commitErrorText_P(MSG_SYNTAX_AUTORUN);
+          return true;
+        }
+        p = end;
+        skipWs(&p);
+        if (*p != '\0') {
+          commitErrorText_P(MSG_SYNTAX_AUTORUN);
+          return true;
+        }
+        idx = (uint8_t)v;
+      }
+      uint8_t c = 0;
+      int e = 0;
+      if (!eepromScanMeta(&c, &e)) {
+        commitErrorText_P(MSG_AUTORUN_FAIL);
+        return true;
+      }
+      if (c == 0 || idx >= c) {
+        commitErrorText_P(MSG_AUTORUN_BAD_INDEX);
+        return true;
+      }
+      if (!eepromWriteAutorun(1, idx)) {
+        commitErrorText_P(MSG_AUTORUN_FAIL);
+        return true;
+      }
+      commitGreenText_P(MSG_AUTORUN_SET);
+      return true;
+    }
+    commitErrorText_P(MSG_SYNTAX_AUTORUN);
     return true;
   }
 
@@ -1605,7 +1794,21 @@ static bool tryBasicCommand() {
       strcat(out, " t");
       catU32(out, (uint32_t)pt);
       strcat(out, " a");
-      catU32(out, (uint32_t)arg);
+      if (op == OP_SLEEP) {
+        if (pt == PT_NUM6) {
+          catU32(out, (uint32_t)bcSleepMsFromWord(progBC[i]));
+        } else if (pt == PT_STRID) {
+          catU32(out, (uint32_t)arg);
+          strcat(out, "*100ms");
+        } else if (pt == PT_NONE) {
+          catU32(out, (uint32_t)arg);
+          strcat(out, "s");
+        } else {
+          catU32(out, (uint32_t)arg);
+        }
+      } else {
+        catU32(out, (uint32_t)arg);
+      }
       commitGreenText(out);
     }
     for (uint8_t i = 0; i < bcStrCount; i++) {
@@ -1675,7 +1878,11 @@ static bool tryBasicCommand() {
     skipWs(&p);
     char* end = nullptr;
     long arg = strtol(p, &end, 10);
-    if (end == p || arg < 0 || arg > 63) {
+    long argMax = 63L;
+    if (op == OP_SLEEP) {
+      argMax = (bcSleepParseKind == 0) ? 511L : 63L;
+    }
+    if (end == p || arg < 0 || arg > argMax) {
       commitErrorText_P(MSG_SYNTAX_BC_OP_ARG);
       return true;
     }
@@ -1697,7 +1904,17 @@ static bool tryBasicCommand() {
     }
     uint8_t pCount = (op == OP_NOP || op == OP_END) ? 0 : 1;
     uint8_t pType = (pCount == 0) ? PT_NONE : PT_NUM6;
-    progBC[progBCCount++] = bcPack(op, pCount, pType, (uint8_t)arg);
+    if (op == OP_SLEEP) {
+      if (bcSleepParseKind == 1) {
+        progBC[progBCCount++] = bcPack(OP_SLEEP, 1, PT_STRID, (uint8_t)arg);
+      } else if (bcSleepParseKind == 2) {
+        progBC[progBCCount++] = bcPack(OP_SLEEP, 1, PT_NONE, (uint8_t)arg);
+      } else {
+        progBC[progBCCount++] = bcPackSleepMs((uint16_t)arg);
+      }
+    } else {
+      progBC[progBCCount++] = bcPack(op, pCount, pType, (uint8_t)arg);
+    }
     progCompiled = true;
     progNeedsSave = true;
     strcpy(out, "bc ");
@@ -1799,7 +2016,26 @@ static bool tryBasicCommand() {
       commitErrorText_P(MSG_SYNTAX_BCX);
       return true;
     }
-    if (op < 0 || op > 7 || t < 0 || t > 2 || a < 0 || a > 63) {
+    if (op < 0 || op > 7 || t < 0 || t > 2 || a < 0) {
+      commitErrorText_P(MSG_BCX_RANGE);
+      return true;
+    }
+    if ((uint8_t)op == OP_SLEEP) {
+      if (t == PT_NUM6) {
+        if (a > 511) {
+          commitErrorText_P(MSG_BCX_RANGE);
+          return true;
+        }
+      } else if (t == PT_STRID || t == PT_NONE) {
+        if (a > 63) {
+          commitErrorText_P(MSG_BCX_RANGE);
+          return true;
+        }
+      } else {
+        commitErrorText_P(MSG_BCX_RANGE);
+        return true;
+      }
+    } else if (a > 63) {
       commitErrorText_P(MSG_BCX_RANGE);
       return true;
     }
@@ -1807,11 +2043,24 @@ static bool tryBasicCommand() {
     if ((uint8_t)op == OP_NOP || (uint8_t)op == OP_END) {
       pCount = 0;
     }
+    if ((uint8_t)op == OP_SLEEP && (uint8_t)t == PT_NONE) {
+      pCount = 1;
+    }
     if (progBCCount >= BC_MAX_INS) {
       commitErrorText_P(MSG_BC_FULL);
       return true;
     }
-    progBC[progBCCount++] = bcPack((uint8_t)op, pCount, (uint8_t)t, (uint8_t)a);
+    if ((uint8_t)op == OP_SLEEP) {
+      if (t == PT_NUM6) {
+        progBC[progBCCount++] = bcPackSleepMs((uint16_t)a);
+      } else if (t == PT_STRID) {
+        progBC[progBCCount++] = bcPack(OP_SLEEP, 1, PT_STRID, (uint8_t)(a & 0x3F));
+      } else {
+        progBC[progBCCount++] = bcPack(OP_SLEEP, 1, PT_NONE, (uint8_t)(a & 0x3F));
+      }
+    } else {
+      progBC[progBCCount++] = bcPack((uint8_t)op, pCount, (uint8_t)t, (uint8_t)a);
+    }
     progCompiled = true;
     progNeedsSave = true;
     strcpy(out, "bcx ");
@@ -2500,9 +2749,22 @@ void setup() {
 
   bcStringReset();
   clear();
-  if (loadBCFromEEPROMIndex(0)) {
-    progNeedsSave = false;
-    commitGreenText_P(MSG_BYTECODE_READY);
+  uint8_t progCount = 0;
+  int eoa = 0;
+  if (eepromScanMeta(&progCount, &eoa)) {
+    if (eepromAutorunEnable && progCount > 0 && eepromAutorunIndex < progCount) {
+      if (loadBCFromEEPROMIndex(eepromAutorunIndex)) {
+        progNeedsSave = false;
+        vmStart();
+        commitGreenText_P(MSG_VM_RUNNING);
+      } else if (loadBCFromEEPROMIndex(0)) {
+        progNeedsSave = false;
+        commitGreenText_P(MSG_BYTECODE_READY);
+      }
+    } else if (loadBCFromEEPROMIndex(0)) {
+      progNeedsSave = false;
+      commitGreenText_P(MSG_BYTECODE_READY);
+    }
   }
 }
 

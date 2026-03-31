@@ -16,18 +16,18 @@ except ImportError:
 # LED en pin 6 (no usar 13: es SCK del TFT). Cambia BLINK_PIN si usas otro GPIO.
 BLINK_PIN = 2
 
+# Bytecode: un único print al inicio (ins 0); el bucle empieza en ins 1 → bc(goto,1).
+# Esperas: bc(sleep,ms) 0–511 ms | bc(sleep100,n) n×100 ms (n 0–63, hasta 6.3 s) | bc(sleeps,n) n s (0–63).
 PROGRAM_LINES = [
     "eperase",
     "bcclr",
-    'bcstr("Turn on")',
-    'bcstr("Turn off")',
-    f"bc(high,{BLINK_PIN})",
+    'bcstr("Starting")',
     "bcx(5,2,0)",
-    "bc(sleep,10)",
+    f"bc(high,{BLINK_PIN})",
+    "bc(sleep,100)",
     f"bc(low,{BLINK_PIN})",
-    "bcx(5,2,1)",
-    "bc(sleep,10)",
-    "bc(goto,0)",
+    "bc(sleep,100)",
+    "bc(goto,1)",
     "bcsave",
     "run(0)",
 ]
