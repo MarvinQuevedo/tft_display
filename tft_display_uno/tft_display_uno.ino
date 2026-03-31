@@ -89,7 +89,6 @@ static bool progCompiled = false;
 static bool vmRunning = false;
 static uint8_t vmPC = 0;
 static uint32_t vmWaitUntilMs = 0;
-static bool programEditMode = false;
 /** true si el bytecode en RAM cambió y no se ha guardado con bcsave desde entonces. */
 static bool progNeedsSave = false;
 static char vmPrintBuf[MAX_LINE_CHARS + 1];
@@ -143,12 +142,10 @@ CMD_DECL(CMD_BCSTR, "bcstr");
 CMD_DECL(CMD_BCCLR, "bcclr");
 CMD_DECL(CMD_BCSAVE, "bcsave");
 CMD_DECL(CMD_BCLIST, "bclist");
+CMD_DECL(CMD_BCDUMP, "bcdump");
 CMD_DECL(CMD_PLIST, "plist");
 CMD_DECL(CMD_EPERASE, "eperase");
 CMD_DECL(CMD_LET, "let");
-CMD_DECL(CMD_EDIT, "edit");
-CMD_DECL(CMD_DONE, "done");
-CMD_DECL(CMD_QUIT, "quit");
 
 MSG_DECL(MSG_VM_BAD_PARAMS, "vm bad params");
 MSG_DECL(MSG_VM_GOTO_OOR, "vm goto out range");
@@ -186,6 +183,7 @@ MSG_DECL(MSG_NO_BYTECODE, "no bytecode");
 MSG_DECL(MSG_SAVE_FAILED_FULL, "save failed/full");
 MSG_DECL(MSG_SAVE_VERIFY_FAILED, "save verify failed");
 MSG_DECL(MSG_SYNTAX_BCLIST, "syntax: bclist");
+MSG_DECL(MSG_SYNTAX_BCDUMP, "syntax: bcdump");
 MSG_DECL(MSG_SYNTAX_PLIST, "syntax: plist");
 MSG_DECL(MSG_SYNTAX_BC_OP_ARG, "syntax: bc(op,arg)");
 MSG_DECL(MSG_STRING_POOL_FULL, "string pool full");
@@ -208,15 +206,11 @@ MSG_DECL(MSG_OK, "ok");
 MSG_DECL(MSG_HIGH_TXT, "HIGH");
 MSG_DECL(MSG_LOW_TXT, "LOW");
 MSG_DECL(MSG_BYTECODE_READY, "bytecode ready");
-MSG_DECL(MSG_CMDS_HELP, "cmds: edit bcsave bclist run load");
+MSG_DECL(MSG_CMDS_HELP, "cmds: bcsave bclist bcdump run load");
 MSG_DECL(MSG_SYNTAX_SUM, "syntax: sum");
 MSG_DECL(MSG_SYNTAX_MUL, "syntax: mul");
 MSG_DECL(MSG_SYNTAX_SUB, "syntax: sub");
 MSG_DECL(MSG_SYNTAX_DIV, "syntax: div");
-MSG_DECL(MSG_EDITOR_ON, "editor on");
-MSG_DECL(MSG_EDITOR_OFF, "editor off");
-MSG_DECL(MSG_WARN_UNSAVED, "warn: bcsave or quit");
-MSG_DECL(MSG_SYNTAX_PLINE, "syntax: edit");
 
 static char flashMsgBuf[MAX_LINE_CHARS + 1];
 
@@ -283,8 +277,7 @@ static void paintRowAt(uint8_t row, const char* s, uint16_t fg) {
 }
 
 static void paintEditingRow() {
-  uint16_t fg = programEditMode ? ILI9341_WHITE : ILI9341_DARKGREY;
-  paintRowAt(rowCount, curLine, fg);
+  paintRowAt(rowCount, curLine, ILI9341_DARKGREY);
 }
 
 /** Pantalla llena: borra todo; 3 líneas verdes = dos anteriores (hist) + última; edición abajo.
@@ -627,14 +620,13 @@ static bool lineMaybeBasicCommand(void) {
   if (keywordAtP(p, CMD_HELP, CMD_HELP_LEN) || keywordAtP(p, CMD_PRINT, CMD_PRINT_LEN) || keywordAtP(p, CMD_SUM, CMD_SUM_LEN)
       || keywordAtP(p, CMD_MUL, CMD_MUL_LEN) || keywordAtP(p, CMD_SUB, CMD_SUB_LEN) || keywordAtP(p, CMD_DIV, CMD_DIV_LEN)
       || keywordAtP(p, CMD_CONCAT, CMD_CONCAT_LEN) || keywordAtP(p, CMD_OUT, CMD_OUT_LEN) || keywordAtP(p, CMD_IN, CMD_IN_LEN)
-      || keywordAtP(p, CMD_HIGH, CMD_HIGH_LEN) || keywordAtP(p, CMD_LOW, CMD_LOW_LEN) || keywordAtP(p, CMD_RESTART, CMD_RESTART_LEN)
-      || keywordAtP(p, CMD_EDIT, CMD_EDIT_LEN) || keywordAtP(p, CMD_DONE, CMD_DONE_LEN)
-      || keywordAtP(p, CMD_QUIT, CMD_QUIT_LEN)
+      || keywordAtP(p, CMD_HIGH, CMD_HIGH_LEN) || keywordAtP(p, CMD_LOW, CMD_LOW_LEN)       || keywordAtP(p, CMD_RESTART, CMD_RESTART_LEN)
       || keywordAtP(p, CMD_CLEAR, CMD_CLEAR_LEN) || keywordAtP(p, CMD_RUN, CMD_RUN_LEN) || keywordAtP(p, CMD_STOP, CMD_STOP_LEN)
       || keywordAtP(p, CMD_LOAD, CMD_LOAD_LEN) || keywordAtP(p, CMD_BC, CMD_BC_LEN) || keywordAtP(p, CMD_BCX, CMD_BCX_LEN)
       || keywordAtP(p, CMD_BCSTR, CMD_BCSTR_LEN) || keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)
       || keywordAtP(p, CMD_BCSAVE, CMD_BCSAVE_LEN) || keywordAtP(p, CMD_BCLIST, CMD_BCLIST_LEN)
-      || keywordAtP(p, CMD_PLIST, CMD_PLIST_LEN) || keywordAtP(p, CMD_EPERASE, CMD_EPERASE_LEN)) {
+      || keywordAtP(p, CMD_BCDUMP, CMD_BCDUMP_LEN) || keywordAtP(p, CMD_PLIST, CMD_PLIST_LEN)
+      || keywordAtP(p, CMD_EPERASE, CMD_EPERASE_LEN)) {
     return true;
   }
 
@@ -675,9 +667,9 @@ static bool isKnownCmdWord(const char* w) {
          || strcmp_P(w, CMD_CLEAR) == 0 || strcmp_P(w, CMD_RUN) == 0 || strcmp_P(w, CMD_STOP) == 0
          || strcmp_P(w, CMD_LOAD) == 0 || strcmp_P(w, CMD_BC) == 0 || strcmp_P(w, CMD_BCX) == 0
          || strcmp_P(w, CMD_BCSTR) == 0 || strcmp_P(w, CMD_BCCLR) == 0
-         || strcmp_P(w, CMD_BCSAVE) == 0 || strcmp_P(w, CMD_BCLIST) == 0 || strcmp_P(w, CMD_PLIST) == 0
-         || strcmp_P(w, CMD_EPERASE) == 0 || strcmp_P(w, CMD_EDIT) == 0 || strcmp_P(w, CMD_DONE) == 0
-         || strcmp_P(w, CMD_QUIT) == 0;
+         || strcmp_P(w, CMD_BCSAVE) == 0 || strcmp_P(w, CMD_BCLIST) == 0 || strcmp_P(w, CMD_BCDUMP) == 0
+         || strcmp_P(w, CMD_PLIST) == 0
+         || strcmp_P(w, CMD_EPERASE) == 0;
 }
 
 static bool isTftReservedPin(uint8_t pin) {
@@ -711,7 +703,6 @@ static void clear() {
   memset(vars, 0, sizeof(vars));
   strVarsMask = 0;
   memset(strVars, 0, sizeof(strVars));
-  programEditMode = false;
 
   curLen = 0;
   curLine[0] = '\0';
@@ -1112,6 +1103,52 @@ static bool saveBCToEEPROM() {
   return true;
 }
 
+static void hexFlushLine(char* line, uint8_t* pos) {
+  if (*pos == 0) {
+    return;
+  }
+  if (line[*pos - 1] == ' ') {
+    (*pos)--;
+  }
+  line[*pos] = '\0';
+  commitGreenText(line);
+  *pos = 0;
+}
+
+static void hexAppendByte(char* line, uint8_t* pos, uint8_t b) {
+  static const char xd[] = "0123456789abcdef";
+  if (*pos + 3 > MAX_LINE_CHARS) {
+    hexFlushLine(line, pos);
+  }
+  line[(*pos)++] = xd[b >> 4];
+  line[(*pos)++] = xd[b & 0x0F];
+  line[(*pos)++] = ' ';
+}
+
+/** Mismo orden de bytes que saveBCToEEPROM() (un registro), en hex por líneas. */
+static void dumpBcRecordAsStoredHex() {
+  char line[MAX_LINE_CHARS + 1];
+  uint8_t pos = 0;
+  hexAppendByte(line, &pos, EEPROM_REC_START);
+  hexAppendByte(line, &pos, progBCCount);
+  hexAppendByte(line, &pos, bcStrCount);
+  for (uint8_t i = 0; i < progBCCount; i++) {
+    uint16_t w = progBC[i];
+    hexAppendByte(line, &pos, (uint8_t)(w & 0xFF));
+    hexAppendByte(line, &pos, (uint8_t)(w >> 8));
+  }
+  for (uint8_t i = 0; i < bcStrCount; i++) {
+    hexAppendByte(line, &pos, (uint8_t)(ARG_TYPE_STRING | ARG_LEN_CODE_1B));
+    hexAppendByte(line, &pos, bcStrLen[i]);
+    const char* s = bcStringById(i);
+    for (uint8_t j = 0; j < bcStrLen[i]; j++) {
+      hexAppendByte(line, &pos, (uint8_t)s[j]);
+    }
+  }
+  hexAppendByte(line, &pos, EEPROM_REC_END);
+  hexFlushLine(line, &pos);
+}
+
 static bool loadBCFromEEPROMIndex(uint8_t wantedIndex) {
   uint8_t count = 0;
   int addr = EEPROM_ADDR_BASE;
@@ -1447,109 +1484,6 @@ static bool parseBcOpToken(const char** pp, uint8_t* outOp) {
   return true;
 }
 
-static bool parseOneArgParensOrSpace(const char** pp, long* out) {
-  const char* p = *pp;
-  skipWs(&p);
-  if (*p == '(') {
-    p++;
-    skipWs(&p);
-    char* end = nullptr;
-    long v = strtol(p, &end, 10);
-    if (end == p) {
-      return false;
-    }
-    p = end;
-    skipWs(&p);
-    if (*p != ')') {
-      return false;
-    }
-    p++;
-    skipWs(&p);
-    if (*p != '\0') {
-      return false;
-    }
-    *out = v;
-    *pp = p;
-    return true;
-  }
-
-  char* end = nullptr;
-  long v = strtol(p, &end, 10);
-  if (end == p) {
-    return false;
-  }
-  p = end;
-  skipWs(&p);
-  if (*p != '\0') {
-    return false;
-  }
-  *out = v;
-  *pp = p;
-  return true;
-}
-
-static bool compileProgramPrefixedLine(const char* p, char* out, size_t outMax) {
-  if (progBCCount >= BC_MAX_INS) {
-    commitErrorText_P(MSG_BC_FULL);
-    return true;
-  }
-
-  const char* q = p;
-  if (keywordAtP(q, CMD_HIGH, CMD_HIGH_LEN)) {
-    q += CMD_HIGH_LEN;
-    long pin = 0;
-    if (!parseOneArgParensOrSpace(&q, &pin) || pin < 0 || pin > 63) {
-      commitErrorText_P(MSG_SYNTAX_PLINE);
-      return true;
-    }
-    progBC[progBCCount++] = bcPack(OP_HIGH, 1, PT_NUM6, (uint8_t)pin);
-  } else if (keywordAtP(q, CMD_LOW, CMD_LOW_LEN)) {
-    q += CMD_LOW_LEN;
-    long pin = 0;
-    if (!parseOneArgParensOrSpace(&q, &pin) || pin < 0 || pin > 63) {
-      commitErrorText_P(MSG_SYNTAX_PLINE);
-      return true;
-    }
-    progBC[progBCCount++] = bcPack(OP_LOW, 1, PT_NUM6, (uint8_t)pin);
-  } else if (keywordAtP(q, CMD_SLEEP, CMD_SLEEP_LEN)) {
-    q += CMD_SLEEP_LEN;
-    long ticks = 0;
-    if (!parseOneArgParensOrSpace(&q, &ticks) || ticks < 0 || ticks > 63) {
-      commitErrorText_P(MSG_SYNTAX_PLINE);
-      return true;
-    }
-    progBC[progBCCount++] = bcPack(OP_SLEEP, 1, PT_NUM6, (uint8_t)ticks);
-  } else if (keywordAtP(q, CMD_GOTO, CMD_GOTO_LEN)) {
-    q += CMD_GOTO_LEN;
-    long idx = 0;
-    if (!parseOneArgParensOrSpace(&q, &idx) || idx < 0 || idx > 63) {
-      commitErrorText_P(MSG_SYNTAX_PLINE);
-      return true;
-    }
-    progBC[progBCCount++] = bcPack(OP_GOTO, 1, PT_NUM6, (uint8_t)idx);
-  } else if (keywordAtP(q, CMD_END, CMD_END_LEN)) {
-    q += CMD_END_LEN;
-    skipWs(&q);
-    if (*q != '\0') {
-      commitErrorText_P(MSG_SYNTAX_PLINE);
-      return true;
-    }
-    progBC[progBCCount++] = bcPack(OP_END, 0, PT_NONE, 0);
-  } else {
-    commitErrorText_P(MSG_SYNTAX_PLINE);
-    return true;
-  }
-
-  progCompiled = true;
-  progNeedsSave = true;
-  out[0] = '\0';
-  strcat(out, "p ");
-  catU32(out, (uint32_t)progBCCount);
-  (void)outMax;
-  commitTwoGreenText(curLine, out);
-  return true;
-}
-
 static const char* vmStringById(uint8_t id) { return bcStringById(id); }
 
 static void vmPrintBufClear() {
@@ -1584,62 +1518,6 @@ static bool tryBasicCommand() {
   }
 
   char out[MAX_LINE_CHARS + 1];
-  if (programEditMode
-      && !keywordAtP(p, CMD_DONE, CMD_DONE_LEN)
-      && !keywordAtP(p, CMD_QUIT, CMD_QUIT_LEN)
-      && !keywordAtP(p, CMD_RUN, CMD_RUN_LEN)
-      && !keywordAtP(p, CMD_STOP, CMD_STOP_LEN)
-      && !keywordAtP(p, CMD_BCSAVE, CMD_BCSAVE_LEN)
-      && !keywordAtP(p, CMD_BCLIST, CMD_BCLIST_LEN)
-      && !keywordAtP(p, CMD_PLIST, CMD_PLIST_LEN)
-      && !keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)
-      && !keywordAtP(p, CMD_CLEAR, CMD_CLEAR_LEN)
-      && !keywordAtP(p, CMD_RESTART, CMD_RESTART_LEN)
-      && !keywordAtP(p, CMD_HELP, CMD_HELP_LEN)
-      && !keywordAtP(p, CMD_BCSTR, CMD_BCSTR_LEN)
-      && !keywordAtP(p, CMD_BC, CMD_BC_LEN)
-      && !keywordAtP(p, CMD_BCX, CMD_BCX_LEN)) {
-    return compileProgramPrefixedLine(p, out, sizeof(out));
-  }
-
-  if (keywordAtP(p, CMD_EDIT, CMD_EDIT_LEN)) {
-    p += CMD_EDIT_LEN;
-    skipWs(&p);
-    if (*p != '\0') {
-      commitErrorText_P(MSG_SYNTAX_PLINE);
-      return true;
-    }
-    programEditMode = true;
-    commitGreenText_P(MSG_EDITOR_ON);
-    return true;
-  }
-  if (keywordAtP(p, CMD_QUIT, CMD_QUIT_LEN)) {
-    p += CMD_QUIT_LEN;
-    skipWs(&p);
-    if (*p != '\0') {
-      commitErrorText_P(MSG_SYNTAX_PLINE);
-      return true;
-    }
-    programEditMode = false;
-    progNeedsSave = false;
-    commitGreenText_P(MSG_EDITOR_OFF);
-    return true;
-  }
-  if (keywordAtP(p, CMD_DONE, CMD_DONE_LEN)) {
-    p += CMD_DONE_LEN;
-    skipWs(&p);
-    if (*p != '\0') {
-      commitErrorText_P(MSG_SYNTAX_PLINE);
-      return true;
-    }
-    if (programEditMode && progNeedsSave && progBCCount > 0) {
-      commitWarnText_P(MSG_WARN_UNSAVED);
-      return true;
-    }
-    programEditMode = false;
-    commitGreenText_P(MSG_EDITOR_OFF);
-    return true;
-  }
 
   if (keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)) {
     p += CMD_BCCLR_LEN;
@@ -1738,6 +1616,21 @@ static bool tryBasicCommand() {
       strcat(out, "\"");
       commitGreenText(out);
     }
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_BCDUMP, CMD_BCDUMP_LEN)) {
+    p += CMD_BCDUMP_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_BCDUMP);
+      return true;
+    }
+    if (!progCompiled || progBCCount == 0) {
+      commitGreenText_P(MSG_EMPTY);
+      return true;
+    }
+    dumpBcRecordAsStoredHex();
     return true;
   }
 

@@ -19,8 +19,8 @@ BLINK_PIN = 2
 PROGRAM_LINES = [
     "eperase",
     "bcclr",
-    'bcstr("encendiendo")',
-    'bcstr("apagando")',
+    'bcstr("Turn on")',
+    'bcstr("Turn off")',
     f"bc(high,{BLINK_PIN})",
     "bcx(5,2,0)",
     "bc(sleep,10)",
