@@ -105,6 +105,10 @@ static uint8_t termMaxLines() {
   return m;
 }
 
+static void serialOutLine(const char* s) {
+  Serial.println(s);
+}
+
 static void paintRowAt(uint8_t row, const char* s, uint16_t fg) {
   int16_t y = (int16_t)row * (int16_t)LINE_HEIGHT;
   if (y >= tft.height()) {
@@ -160,6 +164,7 @@ static void emitOneChunk(uint8_t cols) {
   curLen = rest;
 
   uint8_t maxR = termMaxLines();
+  serialOutLine(chunk);
 
   if (rowCount >= maxR - 1) {
     screenFullReset(chunk);
@@ -541,8 +546,10 @@ static void clear() {
   rowCount = 0;
 
   paintRowAt(0, "UNO Terminal", ILI9341_GREEN);
+  serialOutLine("UNO Terminal");
   histPush("UNO Terminal");
   paintRowAt(1, "115200 baud", ILI9341_GREEN);
+  serialOutLine("115200 baud");
   histPush("115200 baud");
   {
     char info[16];
@@ -559,6 +566,7 @@ static void clear() {
     info[8] = (char)('0' + (m % 10));
     info[9] = '\0';
     paintRowAt(2, info, ILI9341_GREEN);
+    serialOutLine(info);
     histPush(info);
   }
   rowCount = 3;
@@ -571,8 +579,7 @@ static void restartTerminal() {
 
 /** Mensaje de error en rojo; siempre Serial + TFT (antes se perdía TFT si rowCount >= maxR). */
 static void commitErrorText(const char* msg) {
-  Serial.println(msg);
-
+  serialOutLine(msg);
   uint8_t maxR = termMaxLines();
   if (rowCount >= maxR) {
     tft.fillScreen(ILI9341_BLACK);
@@ -602,6 +609,7 @@ static void commitErrorText(const char* msg) {
 
 /** Una línea de salida en verde (misma lógica que una línea confirmada en el terminal). */
 static void commitGreenText(const char* tmp) {
+  serialOutLine(tmp);
   uint8_t maxR = termMaxLines();
   if (rowCount >= maxR) {
     return;
@@ -620,6 +628,8 @@ static void commitGreenText(const char* tmp) {
  *  Esto evita que, si estabas casi al límite, el primer commit se pierda
  *  por un reset entre líneas. */
 static void commitTwoGreenText(const char* first, const char* second) {
+  serialOutLine(first);
+  serialOutLine(second);
   uint8_t maxR = termMaxLines();
 
   if (rowCount <= maxR - 2) {
@@ -739,7 +749,6 @@ static bool tryBasicCommand() {
       return true;
     }
     restartTerminal();
-    Serial.println(F("restarted"));
     return true;
   }
 
@@ -761,7 +770,6 @@ static bool tryBasicCommand() {
       return true;
     }
     clear();
-    Serial.println(F("cleared"));
     return true;
   }
 
@@ -804,7 +812,6 @@ static bool tryBasicCommand() {
     }
     pinMode((uint8_t)pin, OUTPUT);
     commitTwoGreenText(curLine, "ok");
-    Serial.println(F("ok"));
     return true;
   }
 
@@ -842,7 +849,6 @@ static bool tryBasicCommand() {
     }
     pinMode((uint8_t)pin, INPUT);
     commitTwoGreenText(curLine, "ok");
-    Serial.println(F("ok"));
     return true;
   }
 
@@ -880,7 +886,6 @@ static bool tryBasicCommand() {
     }
     digitalWrite((uint8_t)pin, HIGH);
     commitTwoGreenText(curLine, "HIGH");
-    Serial.println(F("HIGH"));
     return true;
   }
 
@@ -918,7 +923,6 @@ static bool tryBasicCommand() {
     }
     digitalWrite((uint8_t)pin, LOW);
     commitTwoGreenText(curLine, "LOW");
-    Serial.println(F("LOW"));
     return true;
   }
 
@@ -1081,7 +1085,6 @@ static bool tryBasicCommand() {
           vars[idxNum] = val;
           snprintf(out, sizeof(out), "%ld", val);
           commitTwoGreenText(curLine, out);
-          Serial.println(out);
           return true;
         }
 
@@ -1126,7 +1129,6 @@ static bool tryBasicCommand() {
           strVarsMask |= (1U << idxStr);
 
           commitTwoGreenText(curLine, tmpStr);
-          Serial.println(tmpStr);
           return true;
         }
       }
@@ -1140,7 +1142,6 @@ static bool tryBasicCommand() {
       commitErrorText("syntax: help");
       return true;
     }
-    Serial.println(F("cmds: print(\"...\") concat(x,y) out(pin) in(pin) high(pin) low(pin) sum(a,b) mul(a,b) sub(a,b) div(a,b) restart help"));
     strncpy(out, "cmds: print concat out in high low sum mul sub div restart", MAX_LINE_CHARS);
     out[MAX_LINE_CHARS] = '\0';
     commitTwoGreenText(curLine, out);
@@ -1161,7 +1162,6 @@ static bool tryBasicCommand() {
       return true;
     }
     commitTwoGreenText(curLine, sOut);
-    Serial.println(sOut);
     return true;
   }
 
@@ -1223,7 +1223,6 @@ static bool tryBasicCommand() {
       return true;
     }
     commitTwoGreenText(curLine, out);
-    Serial.println(out);
     return true;
   }
 
@@ -1238,7 +1237,6 @@ static bool tryBasicCommand() {
     }
     snprintf(out, sizeof(out), "%ld", a + b);
     commitTwoGreenText(curLine, out);
-    Serial.println(out);
     return true;
   }
   if (keywordAt(p, "mul")) {
@@ -1249,7 +1247,6 @@ static bool tryBasicCommand() {
     }
     snprintf(out, sizeof(out), "%ld", a * b);
     commitTwoGreenText(curLine, out);
-    Serial.println(out);
     return true;
   }
   if (keywordAt(p, "sub")) {
@@ -1260,7 +1257,6 @@ static bool tryBasicCommand() {
     }
     snprintf(out, sizeof(out), "%ld", a - b);
     commitTwoGreenText(curLine, out);
-    Serial.println(out);
     return true;
   }
   if (keywordAt(p, "div")) {
@@ -1275,7 +1271,6 @@ static bool tryBasicCommand() {
     }
     snprintf(out, sizeof(out), "%ld", a / b);
     commitTwoGreenText(curLine, out);
-    Serial.println(out);
     return true;
   }
 
@@ -1319,6 +1314,7 @@ static void flushCurrentLine() {
     paintRowAt(0, hist[1], ILI9341_GREEN);
     paintRowAt(1, hist[2], ILI9341_GREEN);
     paintRowAt(2, curLine, ILI9341_GREEN);
+    serialOutLine(curLine);
     rowCount = 3;
     histPush(curLine);
     curLen = 0;
@@ -1328,6 +1324,7 @@ static void flushCurrentLine() {
   }
 
   paintRowAt(rowCount, curLine, ILI9341_GREEN);
+  serialOutLine(curLine);
   histPush(curLine);
   rowCount++;
   curLen = 0;
