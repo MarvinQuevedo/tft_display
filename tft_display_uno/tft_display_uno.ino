@@ -9,6 +9,8 @@
  * depender del wrap del TFT).
  *
  * Pines: CS=10, DC=9, RST=8 | SD_CS=4, TOUCH_CS=5 | MOSI=11, SCK=13
+ * El LED integrado (pin 13) no sirve para blink con el TFT: 13 es SCK y el SPI
+ * lo domina. Ejemplo de LED externo: pin 6 (u otro libre) para bytecode high/low.
  *
  * RST (reset): hardware del ILI9341 en tft.begin(). No limpia píxeles en runtime.
  * Monitor Serie: SERIAL_BAUD (115200 por defecto).
@@ -25,7 +27,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
-#include <stdio.h>
+#include <avr/pgmspace.h>
+#include <EEPROM.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ILI9341.h>
 
@@ -50,7 +53,7 @@ static const uint8_t LINE_HEIGHT = 8;
 /* Buffer de edición; más grande para comandos BASIC sin trocear en verde al escribir. */
 // En la práctica el TFT muestra ~40-50 cols con textSize=1; bajar esto
 // reduce SRAM global y también el pico de stack.
-#define MAX_LINE_CHARS 64
+#define MAX_LINE_CHARS 32
 
 static char curLine[MAX_LINE_CHARS + 1];
 static uint8_t curLen = 0;
@@ -60,15 +63,15 @@ static uint8_t rowCount = 0;
 // Numeric variables:
 // - A..Z are aliases for V0..V25
 // - V0..V31 are supported for more variables.
-#define NUM_VARS 32
+#define NUM_VARS 8
 static long vars[NUM_VARS];
 // bit i == variable i ya definida
 static uint32_t varsMask = 0;
 static bool parseLastUndefinedVar = false;
 
 // String variables: S0$..S7$
-#define STR_VARS 12
-#define STR_MAX_LEN 24
+#define STR_VARS 2
+#define STR_MAX_LEN 8
 static char strVars[STR_VARS][STR_MAX_LEN + 1];
 // bit i == string var i ya definida
 static uint16_t strVarsMask = 0;
@@ -76,6 +79,158 @@ static bool parseLastUndefinedStrVar = false;
 
 /** Últimas 3 líneas fijadas (verde); al reset: filas 0..2 = hist[1], hist[2], última. */
 static char hist[3][MAX_LINE_CHARS + 1];
+
+// Tiny bytecode VM (EEPROM, no SD)
+static const uint8_t BC_MAX_INS = 48;
+static uint16_t progBC[BC_MAX_INS];
+static uint8_t progBCCount = 0;
+static bool progCompiled = false;
+
+static bool vmRunning = false;
+static uint8_t vmPC = 0;
+static uint32_t vmWaitUntilMs = 0;
+static bool programEditMode = false;
+/** true si el bytecode en RAM cambió y no se ha guardado con bcsave desde entonces. */
+static bool progNeedsSave = false;
+static char vmPrintBuf[MAX_LINE_CHARS + 1];
+static uint8_t vmPrintLen = 0;
+static const uint8_t BC_STR_MAX = 16;
+static const uint16_t BC_STR_POOL_MAX = 192;
+static char bcStrPool[BC_STR_POOL_MAX + 1];
+static uint8_t bcStrCount = 0;
+static uint8_t bcStrOff[BC_STR_MAX];
+static uint8_t bcStrLen[BC_STR_MAX];
+static uint16_t bcStrPoolUsed = 0;
+
+static const int EEPROM_ADDR_BASE = 0;
+static const uint8_t EEPROM_MAGIC0 = 'B';
+static const uint8_t EEPROM_MAGIC1 = 'C';
+static const uint8_t EEPROM_VER = 1;
+static const uint8_t EEPROM_REC_START = 0xA5;
+static const uint8_t EEPROM_REC_END = 0x5A;
+static const uint8_t ARG_TYPE_STRING = 0x20; // bit5 = string
+static const uint8_t ARG_LEN_CODE_1B = 0x00; // bits7..6
+
+#define CMD_DECL(name, text) \
+  static const char name[] PROGMEM = text; \
+  static const uint8_t name##_LEN = (uint8_t)(sizeof(text) - 1)
+#define MSG_DECL(name, text) static const char name[] PROGMEM = text
+
+CMD_DECL(CMD_HELP, "help");
+CMD_DECL(CMD_PRINT, "print");
+CMD_DECL(CMD_SUM, "sum");
+CMD_DECL(CMD_MUL, "mul");
+CMD_DECL(CMD_SUB, "sub");
+CMD_DECL(CMD_DIV, "div");
+CMD_DECL(CMD_CONCAT, "concat");
+CMD_DECL(CMD_OUT, "out");
+CMD_DECL(CMD_IN, "in");
+CMD_DECL(CMD_HIGH, "high");
+CMD_DECL(CMD_LOW, "low");
+CMD_DECL(CMD_SLEEP, "sleep");
+CMD_DECL(CMD_GOTO, "goto");
+CMD_DECL(CMD_NOP, "nop");
+CMD_DECL(CMD_END, "end");
+CMD_DECL(CMD_PUT, "put");
+CMD_DECL(CMD_RESTART, "restart");
+CMD_DECL(CMD_CLEAR, "clear");
+CMD_DECL(CMD_RUN, "run");
+CMD_DECL(CMD_STOP, "stop");
+CMD_DECL(CMD_LOAD, "load");
+CMD_DECL(CMD_BC, "bc");
+CMD_DECL(CMD_BCX, "bcx");
+CMD_DECL(CMD_BCSTR, "bcstr");
+CMD_DECL(CMD_BCCLR, "bcclr");
+CMD_DECL(CMD_BCSAVE, "bcsave");
+CMD_DECL(CMD_BCLIST, "bclist");
+CMD_DECL(CMD_PLIST, "plist");
+CMD_DECL(CMD_EPERASE, "eperase");
+CMD_DECL(CMD_LET, "let");
+CMD_DECL(CMD_EDIT, "edit");
+CMD_DECL(CMD_DONE, "done");
+CMD_DECL(CMD_QUIT, "quit");
+
+MSG_DECL(MSG_VM_BAD_PARAMS, "vm bad params");
+MSG_DECL(MSG_VM_GOTO_OOR, "vm goto out range");
+MSG_DECL(MSG_PRINT_OVERFLOW, "print overflow");
+MSG_DECL(MSG_STR_ID_OOR, "str id out range");
+MSG_DECL(MSG_VM_BAD_OPCODE, "vm bad opcode");
+MSG_DECL(MSG_SYNTAX_ASSIGNMENT, "syntax: assignment");
+MSG_DECL(MSG_UNDEFINED_VAR, "undefined variable");
+MSG_DECL(MSG_UNDEFINED_STR_VAR, "undefined string variable");
+MSG_DECL(MSG_SYNTAX_CONCAT, "syntax: concat");
+MSG_DECL(MSG_SYNTAX_PRINT, "syntax: print");
+MSG_DECL(MSG_DIV_ZERO, "division by zero");
+MSG_DECL(MSG_PIN_OOR, "pin out of range");
+MSG_DECL(MSG_PIN_RESERVED, "pin reserved");
+MSG_DECL(MSG_UNKNOWN_COMMAND, "unknown command");
+MSG_DECL(MSG_SYNTAX_OUT, "syntax: out");
+MSG_DECL(MSG_SYNTAX_IN, "syntax: in");
+MSG_DECL(MSG_SYNTAX_HIGH, "syntax: high");
+MSG_DECL(MSG_SYNTAX_LOW, "syntax: low");
+MSG_DECL(MSG_SYNTAX_HELP, "syntax: help");
+MSG_DECL(MSG_SYNTAX_RUN, "syntax: run");
+MSG_DECL(MSG_SYNTAX_STOP, "syntax: stop");
+MSG_DECL(MSG_SYNTAX_LOAD, "syntax: load");
+MSG_DECL(MSG_SYNTAX_RESTART, "syntax: restart");
+MSG_DECL(MSG_SYNTAX_CLEAR, "syntax: clear");
+MSG_DECL(MSG_BC_FULL, "bc full");
+MSG_DECL(MSG_SYNTAX_BCX, "syntax: bcx(op,t,a)");
+MSG_DECL(MSG_STRING_VAR_OOR, "string variable out of range");
+MSG_DECL(MSG_VAR_OOR, "variable out of range");
+MSG_DECL(MSG_SYNTAX_STR_ASSIGN, "syntax: string assignment");
+MSG_DECL(MSG_SYNTAX_BCCLR, "syntax: bcclr");
+MSG_DECL(MSG_SYNTAX_EPERASE, "syntax: eperase");
+MSG_DECL(MSG_SYNTAX_BCSAVE, "syntax: bcsave");
+MSG_DECL(MSG_NO_BYTECODE, "no bytecode");
+MSG_DECL(MSG_SAVE_FAILED_FULL, "save failed/full");
+MSG_DECL(MSG_SAVE_VERIFY_FAILED, "save verify failed");
+MSG_DECL(MSG_SYNTAX_BCLIST, "syntax: bclist");
+MSG_DECL(MSG_SYNTAX_PLIST, "syntax: plist");
+MSG_DECL(MSG_SYNTAX_BC_OP_ARG, "syntax: bc(op,arg)");
+MSG_DECL(MSG_STRING_POOL_FULL, "string pool full");
+MSG_DECL(MSG_BCX_RANGE, "bcx range");
+MSG_DECL(MSG_LOAD_FAILED, "load failed");
+MSG_DECL(MSG_RUN_LOAD_FAILED, "run load failed");
+MSG_DECL(MSG_NO_BYTECODE_LOADED, "no bytecode loaded");
+MSG_DECL(MSG_SYNTAX_BCSTR, "syntax: bcstr(\"...\")");
+MSG_DECL(MSG_UNO_TERMINAL, "UNO Terminal");
+MSG_DECL(MSG_115200_BAUD, "115200 baud");
+MSG_DECL(MSG_VM_DONE, "vm done");
+MSG_DECL(MSG_VM_END, "vm end");
+MSG_DECL(MSG_BC_CLEARED, "bc cleared");
+MSG_DECL(MSG_EEPROM_ERASED, "eeprom erased");
+MSG_DECL(MSG_EMPTY, "(empty)");
+MSG_DECL(MSG_PROGRAMS_0, "programs:0");
+MSG_DECL(MSG_VM_RUNNING, "vm running");
+MSG_DECL(MSG_VM_STOPPED, "vm stopped");
+MSG_DECL(MSG_OK, "ok");
+MSG_DECL(MSG_HIGH_TXT, "HIGH");
+MSG_DECL(MSG_LOW_TXT, "LOW");
+MSG_DECL(MSG_BYTECODE_READY, "bytecode ready");
+MSG_DECL(MSG_CMDS_HELP, "cmds: edit bcsave bclist run load");
+MSG_DECL(MSG_SYNTAX_SUM, "syntax: sum");
+MSG_DECL(MSG_SYNTAX_MUL, "syntax: mul");
+MSG_DECL(MSG_SYNTAX_SUB, "syntax: sub");
+MSG_DECL(MSG_SYNTAX_DIV, "syntax: div");
+MSG_DECL(MSG_EDITOR_ON, "editor on");
+MSG_DECL(MSG_EDITOR_OFF, "editor off");
+MSG_DECL(MSG_WARN_UNSAVED, "warn: bcsave or quit");
+MSG_DECL(MSG_SYNTAX_PLINE, "syntax: edit");
+
+static char flashMsgBuf[MAX_LINE_CHARS + 1];
+
+/** Append decimal u32 to buf (buf must be a valid C string). Avoids snprintf/printf on AVR. */
+static void catU32(char* buf, uint32_t v) {
+  char t[12];
+  ultoa((unsigned long)v, t, 10);
+  strcat(buf, t);
+}
+
+static void commitErrorText_P(PGM_P msg);
+static void commitGreenText_P(PGM_P msg);
+static void commitWarnText_P(PGM_P msg);
+static void commitTwoGreenTextSecond_P(const char* first, PGM_P second);
 
 static void histPush(const char* s) {
   memcpy(hist[0], hist[1], MAX_LINE_CHARS + 1);
@@ -128,7 +283,8 @@ static void paintRowAt(uint8_t row, const char* s, uint16_t fg) {
 }
 
 static void paintEditingRow() {
-  paintRowAt(rowCount, curLine, ILI9341_DARKGREY);
+  uint16_t fg = programEditMode ? ILI9341_WHITE : ILI9341_DARKGREY;
+  paintRowAt(rowCount, curLine, fg);
 }
 
 /** Pantalla llena: borra todo; 3 líneas verdes = dos anteriores (hist) + última; edición abajo.
@@ -234,6 +390,9 @@ static bool parseValueToken(const char** pp, long* out) {
       return false;
     }
     uint8_t idx = (uint8_t)(name - 'A');
+    if (idx >= NUM_VARS) {
+      return false;
+    }
     p++;
     if ((varsMask & (1UL << idx)) == 0) {
       parseLastUndefinedVar = true;
@@ -344,24 +503,25 @@ static bool parseStringToken(const char** pp, char* out, size_t outMax) {
   return false;
 }
 
-static bool strPrefCi(const char* s, const char* pref) {
-  while (*pref != '\0') {
-    if (tolower((unsigned char)*s) != tolower((unsigned char)*pref)) {
+static bool strPrefCi_P(const char* s, PGM_P pref) {
+  char k = (char)pgm_read_byte(pref);
+  while (k != '\0') {
+    if (tolower((unsigned char)*s) != tolower((unsigned char)k)) {
       return false;
     }
     s++;
     pref++;
+    k = (char)pgm_read_byte(pref);
   }
   return true;
 }
 
 /** Palabra clave seguida de fin, espacio o '(' (evita que "printx" sea print). */
-static bool keywordAt(const char* p, const char* kw) {
-  if (!strPrefCi(p, kw)) {
+static bool keywordAtP(const char* p, PGM_P kw, uint8_t kwLen) {
+  if (!strPrefCi_P(p, kw)) {
     return false;
   }
-  size_t n = strlen(kw);
-  char c = p[n];
+  char c = p[kwLen];
   return c == '\0' || isspace((unsigned char)c) || c == '(';
 }
 
@@ -374,10 +534,10 @@ static bool parseConcatCall(const char** pp, char* out, size_t outMax) {
   parseLastUndefinedVar = false;
   parseLastUndefinedStrVar = false;
   const char* p = *pp;
-  if (!keywordAt(p, "concat")) {
+  if (!keywordAtP(p, CMD_CONCAT, CMD_CONCAT_LEN)) {
     return false;
   }
-  p += 6; // "concat"
+  p += CMD_CONCAT_LEN;
   skipWs(&p);
   if (*p != '(') {
     return false;
@@ -400,7 +560,7 @@ static bool parseConcatCall(const char** pp, char* out, size_t outMax) {
       out[o] = '\0';
     } else if (parseValueToken(&p, &v)) {
       char numBuf[16];
-      snprintf(numBuf, sizeof(numBuf), "%ld", v);
+      ltoa(v, numBuf, 10);
       size_t nl = strlen(numBuf);
       if (o + nl >= outMax) {
         return false;
@@ -434,7 +594,7 @@ static bool parseConcatCall(const char** pp, char* out, size_t outMax) {
       out[o] = '\0';
     } else if (parseValueToken(&p, &v)) {
       char numBuf[16];
-      snprintf(numBuf, sizeof(numBuf), "%ld", v);
+      ltoa(v, numBuf, 10);
       size_t nl = strlen(numBuf);
       if (o + nl >= outMax) {
         return false;
@@ -464,11 +624,17 @@ static bool lineMaybeBasicCommand(void) {
   curLine[curLen] = '\0';
   const char* p = curLine;
   skipWs(&p);
-  if (keywordAt(p, "help") || keywordAt(p, "print") || keywordAt(p, "sum")
-      || keywordAt(p, "mul") || keywordAt(p, "sub") || keywordAt(p, "div")
-      || keywordAt(p, "concat") || keywordAt(p, "out") || keywordAt(p, "in")
-      || keywordAt(p, "high") || keywordAt(p, "low") || keywordAt(p, "restart")
-      || keywordAt(p, "clear")) {
+  if (keywordAtP(p, CMD_HELP, CMD_HELP_LEN) || keywordAtP(p, CMD_PRINT, CMD_PRINT_LEN) || keywordAtP(p, CMD_SUM, CMD_SUM_LEN)
+      || keywordAtP(p, CMD_MUL, CMD_MUL_LEN) || keywordAtP(p, CMD_SUB, CMD_SUB_LEN) || keywordAtP(p, CMD_DIV, CMD_DIV_LEN)
+      || keywordAtP(p, CMD_CONCAT, CMD_CONCAT_LEN) || keywordAtP(p, CMD_OUT, CMD_OUT_LEN) || keywordAtP(p, CMD_IN, CMD_IN_LEN)
+      || keywordAtP(p, CMD_HIGH, CMD_HIGH_LEN) || keywordAtP(p, CMD_LOW, CMD_LOW_LEN) || keywordAtP(p, CMD_RESTART, CMD_RESTART_LEN)
+      || keywordAtP(p, CMD_EDIT, CMD_EDIT_LEN) || keywordAtP(p, CMD_DONE, CMD_DONE_LEN)
+      || keywordAtP(p, CMD_QUIT, CMD_QUIT_LEN)
+      || keywordAtP(p, CMD_CLEAR, CMD_CLEAR_LEN) || keywordAtP(p, CMD_RUN, CMD_RUN_LEN) || keywordAtP(p, CMD_STOP, CMD_STOP_LEN)
+      || keywordAtP(p, CMD_LOAD, CMD_LOAD_LEN) || keywordAtP(p, CMD_BC, CMD_BC_LEN) || keywordAtP(p, CMD_BCX, CMD_BCX_LEN)
+      || keywordAtP(p, CMD_BCSTR, CMD_BCSTR_LEN) || keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)
+      || keywordAtP(p, CMD_BCSAVE, CMD_BCSAVE_LEN) || keywordAtP(p, CMD_BCLIST, CMD_BCLIST_LEN)
+      || keywordAtP(p, CMD_PLIST, CMD_PLIST_LEN) || keywordAtP(p, CMD_EPERASE, CMD_EPERASE_LEN)) {
     return true;
   }
 
@@ -502,11 +668,16 @@ static bool parseLeadingWord(const char** pp, char* buf, size_t maxLen) {
 }
 
 static bool isKnownCmdWord(const char* w) {
-  return strcmp(w, "help") == 0 || strcmp(w, "print") == 0 || strcmp(w, "sum") == 0
-         || strcmp(w, "mul") == 0 || strcmp(w, "sub") == 0 || strcmp(w, "div") == 0
-         || strcmp(w, "concat") == 0 || strcmp(w, "out") == 0 || strcmp(w, "in") == 0
-         || strcmp(w, "high") == 0 || strcmp(w, "low") == 0 || strcmp(w, "restart") == 0
-         || strcmp(w, "clear") == 0;
+  return strcmp_P(w, CMD_HELP) == 0 || strcmp_P(w, CMD_PRINT) == 0 || strcmp_P(w, CMD_SUM) == 0
+         || strcmp_P(w, CMD_MUL) == 0 || strcmp_P(w, CMD_SUB) == 0 || strcmp_P(w, CMD_DIV) == 0
+         || strcmp_P(w, CMD_CONCAT) == 0 || strcmp_P(w, CMD_OUT) == 0 || strcmp_P(w, CMD_IN) == 0
+         || strcmp_P(w, CMD_HIGH) == 0 || strcmp_P(w, CMD_LOW) == 0 || strcmp_P(w, CMD_RESTART) == 0
+         || strcmp_P(w, CMD_CLEAR) == 0 || strcmp_P(w, CMD_RUN) == 0 || strcmp_P(w, CMD_STOP) == 0
+         || strcmp_P(w, CMD_LOAD) == 0 || strcmp_P(w, CMD_BC) == 0 || strcmp_P(w, CMD_BCX) == 0
+         || strcmp_P(w, CMD_BCSTR) == 0 || strcmp_P(w, CMD_BCCLR) == 0
+         || strcmp_P(w, CMD_BCSAVE) == 0 || strcmp_P(w, CMD_BCLIST) == 0 || strcmp_P(w, CMD_PLIST) == 0
+         || strcmp_P(w, CMD_EPERASE) == 0 || strcmp_P(w, CMD_EDIT) == 0 || strcmp_P(w, CMD_DONE) == 0
+         || strcmp_P(w, CMD_QUIT) == 0;
 }
 
 static bool isTftReservedPin(uint8_t pin) {
@@ -540,17 +711,22 @@ static void clear() {
   memset(vars, 0, sizeof(vars));
   strVarsMask = 0;
   memset(strVars, 0, sizeof(strVars));
+  programEditMode = false;
 
   curLen = 0;
   curLine[0] = '\0';
   rowCount = 0;
 
-  paintRowAt(0, "UNO Terminal", ILI9341_GREEN);
-  serialOutLine("UNO Terminal");
-  histPush("UNO Terminal");
-  paintRowAt(1, "115200 baud", ILI9341_GREEN);
-  serialOutLine("115200 baud");
-  histPush("115200 baud");
+  strncpy_P(flashMsgBuf, MSG_UNO_TERMINAL, MAX_LINE_CHARS);
+  flashMsgBuf[MAX_LINE_CHARS] = '\0';
+  paintRowAt(0, flashMsgBuf, ILI9341_GREEN);
+  serialOutLine(flashMsgBuf);
+  histPush(flashMsgBuf);
+  strncpy_P(flashMsgBuf, MSG_115200_BAUD, MAX_LINE_CHARS);
+  flashMsgBuf[MAX_LINE_CHARS] = '\0';
+  paintRowAt(1, flashMsgBuf, ILI9341_GREEN);
+  serialOutLine(flashMsgBuf);
+  histPush(flashMsgBuf);
   {
     char info[16];
     uint8_t c = termCols();
@@ -577,13 +753,13 @@ static void restartTerminal() {
   clear();
 }
 
-/** Mensaje de error en rojo; siempre Serial + TFT (antes se perdía TFT si rowCount >= maxR). */
-static void commitErrorText(const char* msg) {
+/** Mensaje en TFT + Serial (color configurable). */
+static void commitStatusText(const char* msg, uint16_t fg) {
   serialOutLine(msg);
   uint8_t maxR = termMaxLines();
   if (rowCount >= maxR) {
     tft.fillScreen(ILI9341_BLACK);
-    paintRowAt(0, msg, ILI9341_RED);
+    paintRowAt(0, msg, fg);
     rowCount = 1;
     memset(hist, 0, sizeof(hist));
     curLen = 0;
@@ -595,16 +771,44 @@ static void commitErrorText(const char* msg) {
     tft.fillScreen(ILI9341_BLACK);
     paintRowAt(0, hist[1], ILI9341_GREEN);
     paintRowAt(1, hist[2], ILI9341_GREEN);
-    paintRowAt(2, msg, ILI9341_RED);
+    paintRowAt(2, msg, fg);
     rowCount = 3;
     histPush(msg);
     paintEditingRow();
     return;
   }
-  paintRowAt(rowCount, msg, ILI9341_RED);
+  paintRowAt(rowCount, msg, fg);
   histPush(msg);
   rowCount++;
   paintEditingRow();
+}
+
+static void commitErrorText(const char* msg) {
+  commitStatusText(msg, ILI9341_RED);
+}
+
+static void commitErrorText_P(PGM_P msg) {
+  strncpy_P(flashMsgBuf, msg, MAX_LINE_CHARS);
+  flashMsgBuf[MAX_LINE_CHARS] = '\0';
+  commitErrorText(flashMsgBuf);
+}
+
+static void commitWarnText_P(PGM_P msg) {
+  strncpy_P(flashMsgBuf, msg, MAX_LINE_CHARS);
+  flashMsgBuf[MAX_LINE_CHARS] = '\0';
+  commitStatusText(flashMsgBuf, ILI9341_YELLOW);
+}
+
+static void commitGreenText_P(PGM_P msg) {
+  strncpy_P(flashMsgBuf, msg, MAX_LINE_CHARS);
+  flashMsgBuf[MAX_LINE_CHARS] = '\0';
+  commitGreenText(flashMsgBuf);
+}
+
+static void commitTwoGreenTextSecond_P(const char* first, PGM_P second) {
+  strncpy_P(flashMsgBuf, second, MAX_LINE_CHARS);
+  flashMsgBuf[MAX_LINE_CHARS] = '\0';
+  commitTwoGreenText(first, flashMsgBuf);
 }
 
 /** Una línea de salida en verde (misma lógica que una línea confirmada en el terminal). */
@@ -720,6 +924,656 @@ static bool parseTwoLongsAndAdvance(const char* p, const char** outEnd, long* a,
   return true;
 }
 
+enum : uint8_t {
+  OP_NOP = 0,
+  OP_HIGH = 1,
+  OP_LOW = 2,
+  OP_SLEEP = 3, // arg in 100ms ticks
+  OP_GOTO = 4,  // arg is instruction index
+  OP_PRINT = 5, // print line (flush)
+  OP_END = 6,
+  OP_PUT = 7    // append to print buffer (no newline)
+};
+
+enum : uint8_t {
+  PT_NONE = 0,
+  PT_NUM6 = 1,
+  PT_STRID = 2
+};
+
+// Bit layout (16-bit instruction):
+// [15..13] reserved
+// [12..11] p0 type
+// [10..9 ] param count
+// [8 ..6 ] opcode
+// [5 ..0 ] arg0
+static uint16_t bcPack(uint8_t op, uint8_t pCount, uint8_t p0Type, uint8_t arg) {
+  return (uint16_t)(((uint16_t)(p0Type & 0x03) << 11)
+                    | ((uint16_t)(pCount & 0x03) << 9)
+                    | ((uint16_t)(op & 0x07) << 6)
+                    | (uint16_t)(arg & 0x3F));
+}
+
+static uint8_t bcOp(uint16_t w) {
+  return (uint8_t)((w >> 6) & 0x07);
+}
+
+static uint8_t bcParamCount(uint16_t w) {
+  return (uint8_t)((w >> 9) & 0x03);
+}
+
+static uint8_t bcParam0Type(uint16_t w) {
+  return (uint8_t)((w >> 11) & 0x03);
+}
+
+static uint8_t bcArg(uint16_t w) {
+  return (uint8_t)(w & 0x3F);
+}
+
+static void eepromInitContainer() {
+  int addr = EEPROM_ADDR_BASE;
+  EEPROM.update(addr++, EEPROM_MAGIC0);
+  EEPROM.update(addr++, EEPROM_MAGIC1);
+  EEPROM.update(addr++, EEPROM_VER);
+  EEPROM.update(addr++, 0); // number of programs
+}
+
+static void bcStringReset() {
+  bcStrCount = 0;
+  bcStrPoolUsed = 0;
+  bcStrPool[0] = '\0';
+}
+
+static bool bcStringAdd(const char* s, uint8_t* outId) {
+  size_t n = strlen(s);
+  if (n > 255) {
+    return false;
+  }
+  if (bcStrCount >= BC_STR_MAX) {
+    return false;
+  }
+  if ((uint16_t)(bcStrPoolUsed + n + 1) > BC_STR_POOL_MAX) {
+    return false;
+  }
+  uint8_t id = bcStrCount;
+  bcStrOff[id] = (uint8_t)bcStrPoolUsed;
+  bcStrLen[id] = (uint8_t)n;
+  memcpy(bcStrPool + bcStrPoolUsed, s, n);
+  bcStrPoolUsed += (uint16_t)n;
+  bcStrPool[bcStrPoolUsed++] = '\0';
+  bcStrCount++;
+  *outId = id;
+  return true;
+}
+
+static const char* bcStringById(uint8_t id) {
+  if (id >= bcStrCount) {
+    return nullptr;
+  }
+  return bcStrPool + bcStrOff[id];
+}
+
+static bool eepromScanMeta(uint8_t* outCount, int* outEndAddr) {
+  int addr = EEPROM_ADDR_BASE;
+  if (EEPROM.read(addr++) != EEPROM_MAGIC0 || EEPROM.read(addr++) != EEPROM_MAGIC1) {
+    return false;
+  }
+  if (EEPROM.read(addr++) != EEPROM_VER) {
+    return false;
+  }
+  uint8_t count = EEPROM.read(addr++);
+  if (count > 31) {
+    return false;
+  }
+
+  int eelen = EEPROM.length();
+  for (uint8_t i = 0; i < count; i++) {
+    if (addr + 4 >= eelen) {
+      return false;
+    }
+    if (EEPROM.read(addr++) != EEPROM_REC_START) {
+      return false;
+    }
+    uint8_t nIns = EEPROM.read(addr++);
+    uint8_t nStr = EEPROM.read(addr++);
+    if (nIns == 0 || nIns > BC_MAX_INS || nStr > BC_STR_MAX) {
+      return false;
+    }
+    int bytes = (int)nIns * 2;
+    if (addr + bytes >= eelen) {
+      return false;
+    }
+    addr += bytes;
+    for (uint8_t s = 0; s < nStr; s++) {
+      if (addr + 2 >= eelen) {
+        return false;
+      }
+      uint8_t meta = EEPROM.read(addr++);
+      uint8_t len = 0;
+      uint8_t lenCode = (uint8_t)(meta & 0xC0);
+      if (lenCode == ARG_LEN_CODE_1B) {
+        len = EEPROM.read(addr++);
+      } else {
+        return false;
+      }
+      if (addr + len >= eelen) {
+        return false;
+      }
+      addr += len;
+    }
+    if (EEPROM.read(addr++) != EEPROM_REC_END) {
+      return false;
+    }
+  }
+  *outCount = count;
+  *outEndAddr = addr;
+  return true;
+}
+
+static bool saveBCToEEPROM() {
+  if (progBCCount == 0) {
+    return false;
+  }
+  uint8_t count = 0;
+  int endAddr = EEPROM_ADDR_BASE;
+  if (!eepromScanMeta(&count, &endAddr)) {
+    eepromInitContainer();
+    if (!eepromScanMeta(&count, &endAddr)) {
+      return false;
+    }
+  }
+
+  int need = 1 + 1 + 1 + ((int)progBCCount * 2) + 1; // start + nIns + nStr + data + end
+  for (uint8_t i = 0; i < bcStrCount; i++) {
+    need += 2 + (int)bcStrLen[i]; // meta + len + text
+  }
+  if (endAddr + need >= EEPROM.length()) {
+    return false;
+  }
+
+  int addr = endAddr;
+  EEPROM.update(addr++, EEPROM_REC_START);
+  EEPROM.update(addr++, progBCCount);
+  EEPROM.update(addr++, bcStrCount);
+  for (uint8_t i = 0; i < progBCCount; i++) {
+    EEPROM.update(addr++, (uint8_t)(progBC[i] & 0xFF));
+    EEPROM.update(addr++, (uint8_t)(progBC[i] >> 8));
+  }
+  for (uint8_t i = 0; i < bcStrCount; i++) {
+    EEPROM.update(addr++, (uint8_t)(ARG_TYPE_STRING | ARG_LEN_CODE_1B));
+    EEPROM.update(addr++, bcStrLen[i]);
+    const char* s = bcStringById(i);
+    for (uint8_t j = 0; j < bcStrLen[i]; j++) {
+      EEPROM.update(addr++, (uint8_t)s[j]);
+    }
+  }
+  EEPROM.update(addr++, EEPROM_REC_END);
+  EEPROM.update(EEPROM_ADDR_BASE + 3, (uint8_t)(count + 1));
+  return true;
+}
+
+static bool loadBCFromEEPROMIndex(uint8_t wantedIndex) {
+  uint8_t count = 0;
+  int addr = EEPROM_ADDR_BASE;
+  if (!eepromScanMeta(&count, &addr)) {
+    return false;
+  }
+  if (wantedIndex >= count) {
+    return false;
+  }
+
+  addr = EEPROM_ADDR_BASE + 4;
+  for (uint8_t i = 0; i < count; i++) {
+    if (EEPROM.read(addr++) != EEPROM_REC_START) {
+      return false;
+    }
+    uint8_t nIns = EEPROM.read(addr++);
+    uint8_t nStr = EEPROM.read(addr++);
+    if (nIns == 0 || nIns > BC_MAX_INS || nStr > BC_STR_MAX) {
+      return false;
+    }
+    if (i == wantedIndex) {
+      for (uint8_t j = 0; j < nIns; j++) {
+        uint8_t lo = EEPROM.read(addr++);
+        uint8_t hi = EEPROM.read(addr++);
+        progBC[j] = (uint16_t)lo | ((uint16_t)hi << 8);
+      }
+      bcStringReset();
+      for (uint8_t s = 0; s < nStr; s++) {
+        uint8_t meta = EEPROM.read(addr++);
+        uint8_t lenCode = (uint8_t)(meta & 0xC0);
+        bool isStr = (meta & ARG_TYPE_STRING) != 0;
+        if (!isStr || lenCode != ARG_LEN_CODE_1B) {
+          return false;
+        }
+        uint8_t len = EEPROM.read(addr++);
+        if ((uint16_t)(bcStrPoolUsed + len + 1) > BC_STR_POOL_MAX || bcStrCount >= BC_STR_MAX) {
+          return false;
+        }
+        uint8_t id = bcStrCount;
+        bcStrOff[id] = (uint8_t)bcStrPoolUsed;
+        bcStrLen[id] = len;
+        for (uint8_t k = 0; k < len; k++) {
+          bcStrPool[bcStrPoolUsed++] = (char)EEPROM.read(addr++);
+        }
+        bcStrPool[bcStrPoolUsed++] = '\0';
+        bcStrCount++;
+      }
+      if (EEPROM.read(addr++) != EEPROM_REC_END) {
+        return false;
+      }
+      progBCCount = nIns;
+      progCompiled = true;
+      return true;
+    }
+    addr += (int)nIns * 2;
+    for (uint8_t s = 0; s < nStr; s++) {
+      uint8_t meta = EEPROM.read(addr++);
+      uint8_t lenCode = (uint8_t)(meta & 0xC0);
+      uint8_t len = 0;
+      if (lenCode == ARG_LEN_CODE_1B) {
+        len = EEPROM.read(addr++);
+      } else {
+        return false;
+      }
+      addr += len;
+    }
+    if (EEPROM.read(addr++) != EEPROM_REC_END) {
+      return false;
+    }
+  }
+  return false;
+}
+
+static void vmStop() {
+  vmRunning = false;
+  vmPC = 0;
+  vmWaitUntilMs = 0;
+  vmPrintBufClear();
+}
+
+static void vmStart() {
+  vmRunning = true;
+  vmPC = 0;
+  vmWaitUntilMs = 0;
+  vmPrintBufClear();
+}
+
+static void vmStep() {
+  if (!vmRunning) {
+    return;
+  }
+  if (vmPC >= progBCCount) {
+    vmStop();
+    commitGreenText_P(MSG_VM_DONE);
+    return;
+  }
+  uint32_t now = millis();
+  if (vmWaitUntilMs != 0 && (int32_t)(now - vmWaitUntilMs) < 0) {
+    return;
+  }
+  vmWaitUntilMs = 0;
+
+  uint16_t ins = progBC[vmPC];
+  uint8_t op = bcOp(ins);
+  uint8_t pCount = bcParamCount(ins);
+  uint8_t pType = bcParam0Type(ins);
+  uint8_t arg = bcArg(ins);
+
+  switch (op) {
+    case OP_NOP:
+      if (pCount != 0 || pType != PT_NONE) {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      vmPC++;
+      break;
+    case OP_HIGH:
+      if (pCount != 1 || pType != PT_NUM6) {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      pinMode(arg, OUTPUT);
+      digitalWrite(arg, HIGH);
+      vmPC++;
+      break;
+    case OP_LOW:
+      if (pCount != 1 || pType != PT_NUM6) {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      pinMode(arg, OUTPUT);
+      digitalWrite(arg, LOW);
+      vmPC++;
+      break;
+    case OP_SLEEP:
+      if (pCount != 1 || pType != PT_NUM6) {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      vmPC++;
+      vmWaitUntilMs = now + ((uint32_t)arg * 100UL);
+      break;
+    case OP_GOTO:
+      if (pCount != 1 || pType != PT_NUM6) {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      if (arg >= progBCCount) {
+        vmStop();
+        commitErrorText_P(MSG_VM_GOTO_OOR);
+      } else {
+        vmPC = arg;
+      }
+      break;
+    case OP_PRINT: {
+      if (pCount != 1) {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      if (pType == PT_NUM6) {
+        if (!vmPrintBufAppendNum(arg)) {
+          vmStop();
+          commitErrorText_P(MSG_PRINT_OVERFLOW);
+          return;
+        }
+      } else if (pType == PT_STRID) {
+        const char* s = vmStringById(arg);
+        if (s == nullptr) {
+          vmStop();
+          commitErrorText_P(MSG_STR_ID_OOR);
+          return;
+        }
+        if (!vmPrintBufAppendText(s)) {
+          vmStop();
+          commitErrorText_P(MSG_PRINT_OVERFLOW);
+          return;
+        }
+      } else {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      if (vmPrintLen == 0) {
+        commitGreenText("");
+      } else {
+        commitGreenText(vmPrintBuf);
+        vmPrintBufClear();
+      }
+      vmPC++;
+      break;
+    }
+    case OP_END:
+      if (pCount != 0 || pType != PT_NONE) {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      if (vmPrintLen > 0) {
+        commitGreenText(vmPrintBuf);
+        vmPrintBufClear();
+      }
+      vmStop();
+      commitGreenText_P(MSG_VM_END);
+      break;
+    case OP_PUT:
+      if (pCount != 1) {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      if (pType == PT_NUM6) {
+        if (!vmPrintBufAppendNum(arg)) {
+          vmStop();
+          commitErrorText_P(MSG_PRINT_OVERFLOW);
+          break;
+        }
+      } else if (pType == PT_STRID) {
+        const char* s = vmStringById(arg);
+        if (s == nullptr) {
+          vmStop();
+          commitErrorText_P(MSG_STR_ID_OOR);
+          break;
+        }
+        if (!vmPrintBufAppendText(s)) {
+          vmStop();
+          commitErrorText_P(MSG_PRINT_OVERFLOW);
+          break;
+        }
+      } else {
+        vmStop();
+        commitErrorText_P(MSG_VM_BAD_PARAMS);
+        break;
+      }
+      vmPC++;
+      break;
+    default:
+      vmStop();
+      commitErrorText_P(MSG_VM_BAD_OPCODE);
+      break;
+  }
+}
+
+static bool parseOptionalIndex(const char* p, bool* hasArg, uint8_t* outIdx) {
+  const char* q = p;
+  skipWs(&q);
+  if (*q == '\0') {
+    *hasArg = false;
+    *outIdx = 0;
+    return true;
+  }
+  if (*q != '(') {
+    return false;
+  }
+  q++;
+  skipWs(&q);
+  char* end = nullptr;
+  long v = strtol(q, &end, 10);
+  if (end == q || v < 0 || v > 31) {
+    return false;
+  }
+  q = end;
+  skipWs(&q);
+  if (*q != ')') {
+    return false;
+  }
+  q++;
+  skipWs(&q);
+  if (*q != '\0') {
+    return false;
+  }
+  *hasArg = true;
+  *outIdx = (uint8_t)v;
+  return true;
+}
+
+static bool parseBcOpToken(const char** pp, uint8_t* outOp) {
+  const char* p = *pp;
+  skipWs(&p);
+  if (*p == '\0') {
+    return false;
+  }
+
+  if (isdigit((unsigned char)*p)) {
+    char* end = nullptr;
+    long opL = strtol(p, &end, 10);
+    if (end == p || opL < 0 || opL > 7) {
+      return false;
+    }
+    *outOp = (uint8_t)opL;
+    *pp = end;
+    return true;
+  }
+
+  char w[10];
+  size_t i = 0;
+  while (isalpha((unsigned char)*p)) {
+    if (i < sizeof(w) - 1) {
+      w[i++] = (char)tolower((unsigned char)*p);
+    }
+    p++;
+  }
+  w[i] = '\0';
+  if (i == 0) {
+    return false;
+  }
+
+  if (strcmp_P(w, CMD_NOP) == 0) {
+    *outOp = OP_NOP;
+  } else if (strcmp_P(w, CMD_HIGH) == 0) {
+    *outOp = OP_HIGH;
+  } else if (strcmp_P(w, CMD_LOW) == 0) {
+    *outOp = OP_LOW;
+  } else if (strcmp_P(w, CMD_SLEEP) == 0) {
+    *outOp = OP_SLEEP;
+  } else if (strcmp_P(w, CMD_GOTO) == 0) {
+    *outOp = OP_GOTO;
+  } else if (strcmp_P(w, CMD_PRINT) == 0 || strcmp_P(w, CMD_END) == 0) {
+    // "print" compila como OP_PRINT; "end" como OP_END.
+    *outOp = (strcmp_P(w, CMD_END) == 0) ? OP_END : OP_PRINT;
+  } else if (strcmp_P(w, CMD_PUT) == 0) {
+    *outOp = OP_PUT;
+  } else {
+    return false;
+  }
+
+  *pp = p;
+  return true;
+}
+
+static bool parseOneArgParensOrSpace(const char** pp, long* out) {
+  const char* p = *pp;
+  skipWs(&p);
+  if (*p == '(') {
+    p++;
+    skipWs(&p);
+    char* end = nullptr;
+    long v = strtol(p, &end, 10);
+    if (end == p) {
+      return false;
+    }
+    p = end;
+    skipWs(&p);
+    if (*p != ')') {
+      return false;
+    }
+    p++;
+    skipWs(&p);
+    if (*p != '\0') {
+      return false;
+    }
+    *out = v;
+    *pp = p;
+    return true;
+  }
+
+  char* end = nullptr;
+  long v = strtol(p, &end, 10);
+  if (end == p) {
+    return false;
+  }
+  p = end;
+  skipWs(&p);
+  if (*p != '\0') {
+    return false;
+  }
+  *out = v;
+  *pp = p;
+  return true;
+}
+
+static bool compileProgramPrefixedLine(const char* p, char* out, size_t outMax) {
+  if (progBCCount >= BC_MAX_INS) {
+    commitErrorText_P(MSG_BC_FULL);
+    return true;
+  }
+
+  const char* q = p;
+  if (keywordAtP(q, CMD_HIGH, CMD_HIGH_LEN)) {
+    q += CMD_HIGH_LEN;
+    long pin = 0;
+    if (!parseOneArgParensOrSpace(&q, &pin) || pin < 0 || pin > 63) {
+      commitErrorText_P(MSG_SYNTAX_PLINE);
+      return true;
+    }
+    progBC[progBCCount++] = bcPack(OP_HIGH, 1, PT_NUM6, (uint8_t)pin);
+  } else if (keywordAtP(q, CMD_LOW, CMD_LOW_LEN)) {
+    q += CMD_LOW_LEN;
+    long pin = 0;
+    if (!parseOneArgParensOrSpace(&q, &pin) || pin < 0 || pin > 63) {
+      commitErrorText_P(MSG_SYNTAX_PLINE);
+      return true;
+    }
+    progBC[progBCCount++] = bcPack(OP_LOW, 1, PT_NUM6, (uint8_t)pin);
+  } else if (keywordAtP(q, CMD_SLEEP, CMD_SLEEP_LEN)) {
+    q += CMD_SLEEP_LEN;
+    long ticks = 0;
+    if (!parseOneArgParensOrSpace(&q, &ticks) || ticks < 0 || ticks > 63) {
+      commitErrorText_P(MSG_SYNTAX_PLINE);
+      return true;
+    }
+    progBC[progBCCount++] = bcPack(OP_SLEEP, 1, PT_NUM6, (uint8_t)ticks);
+  } else if (keywordAtP(q, CMD_GOTO, CMD_GOTO_LEN)) {
+    q += CMD_GOTO_LEN;
+    long idx = 0;
+    if (!parseOneArgParensOrSpace(&q, &idx) || idx < 0 || idx > 63) {
+      commitErrorText_P(MSG_SYNTAX_PLINE);
+      return true;
+    }
+    progBC[progBCCount++] = bcPack(OP_GOTO, 1, PT_NUM6, (uint8_t)idx);
+  } else if (keywordAtP(q, CMD_END, CMD_END_LEN)) {
+    q += CMD_END_LEN;
+    skipWs(&q);
+    if (*q != '\0') {
+      commitErrorText_P(MSG_SYNTAX_PLINE);
+      return true;
+    }
+    progBC[progBCCount++] = bcPack(OP_END, 0, PT_NONE, 0);
+  } else {
+    commitErrorText_P(MSG_SYNTAX_PLINE);
+    return true;
+  }
+
+  progCompiled = true;
+  progNeedsSave = true;
+  out[0] = '\0';
+  strcat(out, "p ");
+  catU32(out, (uint32_t)progBCCount);
+  (void)outMax;
+  commitTwoGreenText(curLine, out);
+  return true;
+}
+
+static const char* vmStringById(uint8_t id) { return bcStringById(id); }
+
+static void vmPrintBufClear() {
+  vmPrintLen = 0;
+  vmPrintBuf[0] = '\0';
+}
+
+static bool vmPrintBufAppendText(const char* s) {
+  size_t n = strlen(s);
+  if ((size_t)vmPrintLen + n > MAX_LINE_CHARS) {
+    return false;
+  }
+  memcpy(vmPrintBuf + vmPrintLen, s, n);
+  vmPrintLen = (uint8_t)(vmPrintLen + n);
+  vmPrintBuf[vmPrintLen] = '\0';
+  return true;
+}
+
+static bool vmPrintBufAppendNum(uint8_t v) {
+  char b[12];
+  ultoa((unsigned long)(unsigned)v, b, 10);
+  return vmPrintBufAppendText(b);
+}
+
 /** Si la línea actual es un comando BASIC, lo ejecuta y devuelve true (no texto normal). */
 static bool tryBasicCommand() {
   curLine[curLen] = '\0';
@@ -730,10 +1584,413 @@ static bool tryBasicCommand() {
   }
 
   char out[MAX_LINE_CHARS + 1];
+  if (programEditMode
+      && !keywordAtP(p, CMD_DONE, CMD_DONE_LEN)
+      && !keywordAtP(p, CMD_QUIT, CMD_QUIT_LEN)
+      && !keywordAtP(p, CMD_RUN, CMD_RUN_LEN)
+      && !keywordAtP(p, CMD_STOP, CMD_STOP_LEN)
+      && !keywordAtP(p, CMD_BCSAVE, CMD_BCSAVE_LEN)
+      && !keywordAtP(p, CMD_BCLIST, CMD_BCLIST_LEN)
+      && !keywordAtP(p, CMD_PLIST, CMD_PLIST_LEN)
+      && !keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)
+      && !keywordAtP(p, CMD_CLEAR, CMD_CLEAR_LEN)
+      && !keywordAtP(p, CMD_RESTART, CMD_RESTART_LEN)
+      && !keywordAtP(p, CMD_HELP, CMD_HELP_LEN)
+      && !keywordAtP(p, CMD_BCSTR, CMD_BCSTR_LEN)
+      && !keywordAtP(p, CMD_BC, CMD_BC_LEN)
+      && !keywordAtP(p, CMD_BCX, CMD_BCX_LEN)) {
+    return compileProgramPrefixedLine(p, out, sizeof(out));
+  }
+
+  if (keywordAtP(p, CMD_EDIT, CMD_EDIT_LEN)) {
+    p += CMD_EDIT_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_PLINE);
+      return true;
+    }
+    programEditMode = true;
+    commitGreenText_P(MSG_EDITOR_ON);
+    return true;
+  }
+  if (keywordAtP(p, CMD_QUIT, CMD_QUIT_LEN)) {
+    p += CMD_QUIT_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_PLINE);
+      return true;
+    }
+    programEditMode = false;
+    progNeedsSave = false;
+    commitGreenText_P(MSG_EDITOR_OFF);
+    return true;
+  }
+  if (keywordAtP(p, CMD_DONE, CMD_DONE_LEN)) {
+    p += CMD_DONE_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_PLINE);
+      return true;
+    }
+    if (programEditMode && progNeedsSave && progBCCount > 0) {
+      commitWarnText_P(MSG_WARN_UNSAVED);
+      return true;
+    }
+    programEditMode = false;
+    commitGreenText_P(MSG_EDITOR_OFF);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)) {
+    p += CMD_BCCLR_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_BCCLR);
+      return true;
+    }
+    vmStop();
+    progBCCount = 0;
+    progCompiled = false;
+    progNeedsSave = false;
+    bcStringReset();
+    commitGreenText_P(MSG_BC_CLEARED);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_EPERASE, CMD_EPERASE_LEN)) {
+    p += CMD_EPERASE_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_EPERASE);
+      return true;
+    }
+    vmStop();
+    eepromInitContainer();
+    progBCCount = 0;
+    progCompiled = false;
+    progNeedsSave = false;
+    bcStringReset();
+    commitGreenText_P(MSG_EEPROM_ERASED);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_BCSAVE, CMD_BCSAVE_LEN)) {
+    p += CMD_BCSAVE_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_BCSAVE);
+      return true;
+    }
+    if (!progCompiled || progBCCount == 0) {
+      commitErrorText_P(MSG_NO_BYTECODE);
+      return true;
+    }
+    if (!saveBCToEEPROM()) {
+      commitErrorText_P(MSG_SAVE_FAILED_FULL);
+      return true;
+    }
+    uint8_t n = 0;
+    int endAddr = 0;
+    if (!eepromScanMeta(&n, &endAddr) || n == 0) {
+      commitErrorText_P(MSG_SAVE_VERIFY_FAILED);
+      return true;
+    }
+    progNeedsSave = false;
+    strcpy(out, "saved as #");
+    catU32(out, (uint32_t)(n - 1));
+    commitGreenText(out);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_BCLIST, CMD_BCLIST_LEN)) {
+    p += CMD_BCLIST_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_BCLIST);
+      return true;
+    }
+    if (!progCompiled || progBCCount == 0) {
+      commitGreenText_P(MSG_EMPTY);
+      return true;
+    }
+    for (uint8_t i = 0; i < progBCCount; i++) {
+      uint8_t op = bcOp(progBC[i]);
+      uint8_t arg = bcArg(progBC[i]);
+      uint8_t pc = bcParamCount(progBC[i]);
+      uint8_t pt = bcParam0Type(progBC[i]);
+      out[0] = '\0';
+      catU32(out, (uint32_t)i);
+      strcat(out, ":op");
+      catU32(out, (uint32_t)op);
+      strcat(out, " c");
+      catU32(out, (uint32_t)pc);
+      strcat(out, " t");
+      catU32(out, (uint32_t)pt);
+      strcat(out, " a");
+      catU32(out, (uint32_t)arg);
+      commitGreenText(out);
+    }
+    for (uint8_t i = 0; i < bcStrCount; i++) {
+      strcpy(out, "str#");
+      catU32(out, (uint32_t)i);
+      strcat(out, ":\"");
+      strcat(out, bcStringById(i));
+      strcat(out, "\"");
+      commitGreenText(out);
+    }
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_PLIST, CMD_PLIST_LEN)) {
+    p += CMD_PLIST_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_PLIST);
+      return true;
+    }
+    uint8_t count = 0;
+    int endAddr = 0;
+    if (!eepromScanMeta(&count, &endAddr)) {
+      commitGreenText_P(MSG_PROGRAMS_0);
+      return true;
+    }
+    strcpy(out, "programs:");
+    catU32(out, (uint32_t)count);
+    commitGreenText(out);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_BC, CMD_BC_LEN)) {
+    p += CMD_BC_LEN;
+    skipWs(&p);
+    if (*p != '(') {
+      commitErrorText_P(MSG_SYNTAX_BC_OP_ARG);
+      return true;
+    }
+    p++;
+    uint8_t op = 0;
+    if (!parseBcOpToken(&p, &op)) {
+      commitErrorText_P(MSG_SYNTAX_BC_OP_ARG);
+      return true;
+    }
+    skipWs(&p);
+    if (*p != ',') {
+      commitErrorText_P(MSG_SYNTAX_BC_OP_ARG);
+      return true;
+    }
+    p++;
+    skipWs(&p);
+    char* end = nullptr;
+    long arg = strtol(p, &end, 10);
+    if (end == p || arg < 0 || arg > 63) {
+      commitErrorText_P(MSG_SYNTAX_BC_OP_ARG);
+      return true;
+    }
+    p = end;
+    skipWs(&p);
+    if (*p != ')') {
+      commitErrorText_P(MSG_SYNTAX_BC_OP_ARG);
+      return true;
+    }
+    p++;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_BC_OP_ARG);
+      return true;
+    }
+    if (progBCCount >= BC_MAX_INS) {
+      commitErrorText_P(MSG_BC_FULL);
+      return true;
+    }
+    uint8_t pCount = (op == OP_NOP || op == OP_END) ? 0 : 1;
+    uint8_t pType = (pCount == 0) ? PT_NONE : PT_NUM6;
+    progBC[progBCCount++] = bcPack(op, pCount, pType, (uint8_t)arg);
+    progCompiled = true;
+    progNeedsSave = true;
+    strcpy(out, "bc ");
+    catU32(out, (uint32_t)progBCCount);
+    commitGreenText(out);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_BCSTR, CMD_BCSTR_LEN)) {
+    p += CMD_BCSTR_LEN;
+    skipWs(&p);
+    char s[BC_STR_POOL_MAX + 1];
+    bool hasParen = false;
+    if (*p == '(') {
+      hasParen = true;
+      p++;
+      skipWs(&p);
+    }
+    if (!parseStringLiteral(&p, s, sizeof(s))) {
+      commitErrorText_P(MSG_SYNTAX_BCSTR);
+      return true;
+    }
+    if (hasParen) {
+      skipWs(&p);
+      if (*p != ')') {
+        commitErrorText_P(MSG_SYNTAX_BCSTR);
+        return true;
+      }
+      p++;
+    }
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_BCSTR);
+      return true;
+    }
+    uint8_t id = 0;
+    if (!bcStringAdd(s, &id)) {
+      commitErrorText_P(MSG_STRING_POOL_FULL);
+      return true;
+    }
+    progNeedsSave = true;
+    strcpy(out, "str#");
+    catU32(out, (uint32_t)id);
+    commitGreenText(out);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_BCX, CMD_BCX_LEN)) {
+    p += CMD_BCX_LEN;
+    const char* q = p;
+    skipWs(&q);
+    if (*q != '(') {
+      commitErrorText_P(MSG_SYNTAX_BCX);
+      return true;
+    }
+    q++;
+    skipWs(&q);
+    char* end = nullptr;
+    long op = strtol(q, &end, 10);
+    if (end == q) {
+      commitErrorText_P(MSG_SYNTAX_BCX);
+      return true;
+    }
+    q = end;
+    skipWs(&q);
+    if (*q != ',') {
+      commitErrorText_P(MSG_SYNTAX_BCX);
+      return true;
+    }
+    q++;
+    skipWs(&q);
+    long t = strtol(q, &end, 10);
+    if (end == q) {
+      commitErrorText_P(MSG_SYNTAX_BCX);
+      return true;
+    }
+    q = end;
+    skipWs(&q);
+    if (*q != ',') {
+      commitErrorText_P(MSG_SYNTAX_BCX);
+      return true;
+    }
+    q++;
+    skipWs(&q);
+    long a = strtol(q, &end, 10);
+    if (end == q) {
+      commitErrorText_P(MSG_SYNTAX_BCX);
+      return true;
+    }
+    q = end;
+    skipWs(&q);
+    if (*q != ')') {
+      commitErrorText_P(MSG_SYNTAX_BCX);
+      return true;
+    }
+    q++;
+    skipWs(&q);
+    if (*q != '\0') {
+      commitErrorText_P(MSG_SYNTAX_BCX);
+      return true;
+    }
+    if (op < 0 || op > 7 || t < 0 || t > 2 || a < 0 || a > 63) {
+      commitErrorText_P(MSG_BCX_RANGE);
+      return true;
+    }
+    uint8_t pCount = ((uint8_t)t == PT_NONE) ? 0 : 1;
+    if ((uint8_t)op == OP_NOP || (uint8_t)op == OP_END) {
+      pCount = 0;
+    }
+    if (progBCCount >= BC_MAX_INS) {
+      commitErrorText_P(MSG_BC_FULL);
+      return true;
+    }
+    progBC[progBCCount++] = bcPack((uint8_t)op, pCount, (uint8_t)t, (uint8_t)a);
+    progCompiled = true;
+    progNeedsSave = true;
+    strcpy(out, "bcx ");
+    catU32(out, (uint32_t)progBCCount);
+    commitGreenText(out);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_LOAD, CMD_LOAD_LEN)) {
+    p += CMD_LOAD_LEN;
+    bool hasArg = false;
+    uint8_t idx = 0;
+    if (!parseOptionalIndex(p, &hasArg, &idx)) {
+      commitErrorText_P(MSG_SYNTAX_LOAD);
+      return true;
+    }
+    if (!hasArg) {
+      idx = 0;
+    }
+    if (!loadBCFromEEPROMIndex(idx)) {
+      commitErrorText_P(MSG_LOAD_FAILED);
+      return true;
+    }
+    progNeedsSave = false;
+    strcpy(out, "loaded p");
+    catU32(out, (uint32_t)idx);
+    strcat(out, " ");
+    catU32(out, (uint32_t)progBCCount);
+    strcat(out, " ins");
+    commitGreenText(out);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_RUN, CMD_RUN_LEN)) {
+    p += CMD_RUN_LEN;
+    bool hasArg = false;
+    uint8_t idx = 0;
+    if (!parseOptionalIndex(p, &hasArg, &idx)) {
+      commitErrorText_P(MSG_SYNTAX_RUN);
+      return true;
+    }
+    if (hasArg) {
+      if (!loadBCFromEEPROMIndex(idx)) {
+        commitErrorText_P(MSG_RUN_LOAD_FAILED);
+        return true;
+      }
+      progNeedsSave = false;
+    }
+    if (!progCompiled || progBCCount == 0) {
+      commitErrorText_P(MSG_NO_BYTECODE_LOADED);
+      return true;
+    }
+    vmStart();
+    commitGreenText_P(MSG_VM_RUNNING);
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_STOP, CMD_STOP_LEN)) {
+    p += CMD_STOP_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_SYNTAX_STOP);
+      return true;
+    }
+    vmStop();
+    commitGreenText_P(MSG_VM_STOPPED);
+    return true;
+  }
 
   // restart: clears TFT and re-initializes terminal state
-  if (keywordAt(p, "restart")) {
-    p += 7;
+  if (keywordAtP(p, CMD_RESTART, CMD_RESTART_LEN)) {
+    p += CMD_RESTART_LEN;
     skipWs(&p);
     // allow optional parentheses: restart()
     if (*p == '(') {
@@ -745,7 +2002,7 @@ static bool tryBasicCommand() {
       skipWs(&p);
     }
     if (*p != '\0') {
-      commitErrorText("syntax: restart");
+      commitErrorText_P(MSG_SYNTAX_RESTART);
       return true;
     }
     restartTerminal();
@@ -753,8 +2010,8 @@ static bool tryBasicCommand() {
   }
 
   // clear: clears TFT and re-initializes terminal state
-  if (keywordAt(p, "clear")) {
-    p += 5;
+  if (keywordAtP(p, CMD_CLEAR, CMD_CLEAR_LEN)) {
+    p += CMD_CLEAR_LEN;
     skipWs(&p);
     // allow optional parentheses: clear()
     if (*p == '(') {
@@ -766,7 +2023,7 @@ static bool tryBasicCommand() {
       skipWs(&p);
     }
     if (*p != '\0') {
-      commitErrorText("syntax: clear");
+      commitErrorText_P(MSG_SYNTAX_CLEAR);
       return true;
     }
     clear();
@@ -778,151 +2035,151 @@ static bool tryBasicCommand() {
   //   in(pin)   -> pinMode(pin, INPUT)
   //   high(pin) -> digitalWrite(pin, HIGH)
   //   low(pin)  -> digitalWrite(pin, LOW)
-  if (keywordAt(p, "out")) {
-    p += 3;
+  if (keywordAtP(p, CMD_OUT, CMD_OUT_LEN)) {
+    p += CMD_OUT_LEN;
     skipWs(&p);
     if (*p != '(') {
-      commitErrorText("syntax: out");
+      commitErrorText_P(MSG_SYNTAX_OUT);
       return true;
     }
     p++;
     long pin = 0;
     if (!parseValueToken(&p, &pin)) {
-      commitErrorText("syntax: out");
+      commitErrorText_P(MSG_SYNTAX_OUT);
       return true;
     }
     skipWs(&p);
     if (*p != ')') {
-      commitErrorText("syntax: out");
+      commitErrorText_P(MSG_SYNTAX_OUT);
       return true;
     }
     p++;
     skipWs(&p);
     if (*p != '\0') {
-      commitErrorText("syntax: out");
+      commitErrorText_P(MSG_SYNTAX_OUT);
       return true;
     }
     if (pin < 0 || pin > 19) {
-      commitErrorText("pin out of range");
+      commitErrorText_P(MSG_PIN_OOR);
       return true;
     }
     if (isTftReservedPin((uint8_t)pin)) {
-      commitErrorText("pin reserved");
+      commitErrorText_P(MSG_PIN_RESERVED);
       return true;
     }
     pinMode((uint8_t)pin, OUTPUT);
-    commitTwoGreenText(curLine, "ok");
+    commitTwoGreenTextSecond_P(curLine, MSG_OK);
     return true;
   }
 
-  if (keywordAt(p, "in")) {
-    p += 2;
+  if (keywordAtP(p, CMD_IN, CMD_IN_LEN)) {
+    p += CMD_IN_LEN;
     skipWs(&p);
     if (*p != '(') {
-      commitErrorText("syntax: in");
+      commitErrorText_P(MSG_SYNTAX_IN);
       return true;
     }
     p++;
     long pin = 0;
     if (!parseValueToken(&p, &pin)) {
-      commitErrorText("syntax: in");
+      commitErrorText_P(MSG_SYNTAX_IN);
       return true;
     }
     skipWs(&p);
     if (*p != ')') {
-      commitErrorText("syntax: in");
+      commitErrorText_P(MSG_SYNTAX_IN);
       return true;
     }
     p++;
     skipWs(&p);
     if (*p != '\0') {
-      commitErrorText("syntax: in");
+      commitErrorText_P(MSG_SYNTAX_IN);
       return true;
     }
     if (pin < 0 || pin > 19) {
-      commitErrorText("pin out of range");
+      commitErrorText_P(MSG_PIN_OOR);
       return true;
     }
     if (isTftReservedPin((uint8_t)pin)) {
-      commitErrorText("pin reserved");
+      commitErrorText_P(MSG_PIN_RESERVED);
       return true;
     }
     pinMode((uint8_t)pin, INPUT);
-    commitTwoGreenText(curLine, "ok");
+    commitTwoGreenTextSecond_P(curLine, MSG_OK);
     return true;
   }
 
-  if (keywordAt(p, "high")) {
-    p += 4;
+  if (keywordAtP(p, CMD_HIGH, CMD_HIGH_LEN)) {
+    p += CMD_HIGH_LEN;
     skipWs(&p);
     if (*p != '(') {
-      commitErrorText("syntax: high");
+      commitErrorText_P(MSG_SYNTAX_HIGH);
       return true;
     }
     p++;
     long pin = 0;
     if (!parseValueToken(&p, &pin)) {
-      commitErrorText("syntax: high");
+      commitErrorText_P(MSG_SYNTAX_HIGH);
       return true;
     }
     skipWs(&p);
     if (*p != ')') {
-      commitErrorText("syntax: high");
+      commitErrorText_P(MSG_SYNTAX_HIGH);
       return true;
     }
     p++;
     skipWs(&p);
     if (*p != '\0') {
-      commitErrorText("syntax: high");
+      commitErrorText_P(MSG_SYNTAX_HIGH);
       return true;
     }
     if (pin < 0 || pin > 19) {
-      commitErrorText("pin out of range");
+      commitErrorText_P(MSG_PIN_OOR);
       return true;
     }
     if (isTftReservedPin((uint8_t)pin)) {
-      commitErrorText("pin reserved");
+      commitErrorText_P(MSG_PIN_RESERVED);
       return true;
     }
     digitalWrite((uint8_t)pin, HIGH);
-    commitTwoGreenText(curLine, "HIGH");
+    commitTwoGreenTextSecond_P(curLine, MSG_HIGH_TXT);
     return true;
   }
 
-  if (keywordAt(p, "low")) {
-    p += 3;
+  if (keywordAtP(p, CMD_LOW, CMD_LOW_LEN)) {
+    p += CMD_LOW_LEN;
     skipWs(&p);
     if (*p != '(') {
-      commitErrorText("syntax: low");
+      commitErrorText_P(MSG_SYNTAX_LOW);
       return true;
     }
     p++;
     long pin = 0;
     if (!parseValueToken(&p, &pin)) {
-      commitErrorText("syntax: low");
+      commitErrorText_P(MSG_SYNTAX_LOW);
       return true;
     }
     skipWs(&p);
     if (*p != ')') {
-      commitErrorText("syntax: low");
+      commitErrorText_P(MSG_SYNTAX_LOW);
       return true;
     }
     p++;
     skipWs(&p);
     if (*p != '\0') {
-      commitErrorText("syntax: low");
+      commitErrorText_P(MSG_SYNTAX_LOW);
       return true;
     }
     if (pin < 0 || pin > 19) {
-      commitErrorText("pin out of range");
+      commitErrorText_P(MSG_PIN_OOR);
       return true;
     }
     if (isTftReservedPin((uint8_t)pin)) {
-      commitErrorText("pin reserved");
+      commitErrorText_P(MSG_PIN_RESERVED);
       return true;
     }
     digitalWrite((uint8_t)pin, LOW);
-    commitTwoGreenText(curLine, "LOW");
+    commitTwoGreenTextSecond_P(curLine, MSG_LOW_TXT);
     return true;
   }
 
@@ -930,8 +2187,8 @@ static bool tryBasicCommand() {
   {
     const char* q = p;
     skipWs(&q);
-    if (keywordAt(q, "let")) {
-      q += 3;
+    if (keywordAtP(q, CMD_LET, CMD_LET_LEN)) {
+      q += CMD_LET_LEN;
       skipWs(&q);
     }
 
@@ -947,17 +2204,17 @@ static bool tryBasicCommand() {
       char* end = nullptr;
       long idxL = strtol(q, &end, 10);
       if (end == q) {
-        commitErrorText("syntax: assignment");
+        commitErrorText_P(MSG_SYNTAX_ASSIGNMENT);
         return true;
       }
       q = end;
       if (*q != '$') {
-        commitErrorText("syntax: assignment");
+        commitErrorText_P(MSG_SYNTAX_ASSIGNMENT);
         return true;
       }
       q++; // consume '$'
       if (idxL < 0 || idxL >= (long)STR_VARS) {
-        commitErrorText("string variable out of range");
+        commitErrorText_P(MSG_STRING_VAR_OOR);
         return true;
       }
       idxStr = (uint8_t)idxL;
@@ -968,12 +2225,12 @@ static bool tryBasicCommand() {
       char* end = nullptr;
       long idxL = strtol(q, &end, 10);
       if (end == q) {
-        commitErrorText("syntax: assignment");
+        commitErrorText_P(MSG_SYNTAX_ASSIGNMENT);
         return true;
       }
       q = end;
       if (idxL < 0 || idxL >= (long)NUM_VARS) {
-        commitErrorText("variable out of range");
+        commitErrorText_P(MSG_VAR_OOR);
         return true;
       }
       idxNum = (uint8_t)idxL;
@@ -984,7 +2241,7 @@ static bool tryBasicCommand() {
         if (q[1] == '$') {
           uint8_t tmp = (uint8_t)(name - 'A');
           if (tmp >= STR_VARS) {
-            commitErrorText("string variable out of range");
+            commitErrorText_P(MSG_STRING_VAR_OOR);
             return true;
           }
           idxStr = tmp;
@@ -992,6 +2249,10 @@ static bool tryBasicCommand() {
           q += 2; // X$
         } else {
           uint8_t tmp = (uint8_t)(name - 'A');
+          if (tmp >= NUM_VARS) {
+            commitErrorText_P(MSG_VAR_OOR);
+            return true;
+          }
           idxNum = tmp;
           numericTarget = true;
           q++; // consume letter
@@ -1012,58 +2273,58 @@ static bool tryBasicCommand() {
 
           skipWs(&q);
           // Permite RHS: sum(a,b), mul(a,b), sub(a,b), div(a,b)
-          if (keywordAt(q, "sum")) {
+          if (keywordAtP(q, CMD_SUM, CMD_SUM_LEN)) {
             const char* end = nullptr;
-            q += 3; // "sum"
+            q += CMD_SUM_LEN;
             if (!parseTwoLongsAndAdvance(q, &end, &a, &b)) {
-              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             if (*end != '\0') {
-              commitErrorText("syntax: assignment");
+              commitErrorText_P(MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             val = a + b;
             q = end;
-          } else if (keywordAt(q, "mul")) {
+          } else if (keywordAtP(q, CMD_MUL, CMD_MUL_LEN)) {
             const char* end = nullptr;
-            q += 3; // "mul"
+            q += CMD_MUL_LEN;
             if (!parseTwoLongsAndAdvance(q, &end, &a, &b)) {
-              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             if (*end != '\0') {
-              commitErrorText("syntax: assignment");
+              commitErrorText_P(MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             val = a * b;
             q = end;
-          } else if (keywordAt(q, "sub")) {
+          } else if (keywordAtP(q, CMD_SUB, CMD_SUB_LEN)) {
             const char* end = nullptr;
-            q += 3; // "sub"
+            q += CMD_SUB_LEN;
             if (!parseTwoLongsAndAdvance(q, &end, &a, &b)) {
-              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             if (*end != '\0') {
-              commitErrorText("syntax: assignment");
+              commitErrorText_P(MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             val = a - b;
             q = end;
-          } else if (keywordAt(q, "div")) {
+          } else if (keywordAtP(q, CMD_DIV, CMD_DIV_LEN)) {
             const char* end = nullptr;
-            q += 3; // "div"
+            q += CMD_DIV_LEN;
             if (!parseTwoLongsAndAdvance(q, &end, &a, &b)) {
-              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             if (*end != '\0') {
-              commitErrorText("syntax: assignment");
+              commitErrorText_P(MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             if (b == 0) {
-              commitErrorText("division by zero");
+              commitErrorText_P(MSG_DIV_ZERO);
               return true;
             }
             val = a / b;
@@ -1071,19 +2332,19 @@ static bool tryBasicCommand() {
           } else {
             // RHS simple: número literal o VAR
             if (!parseValueToken(&q, &val)) {
-              commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: assignment");
+              commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
             skipWs(&q);
             if (*q != '\0') {
-              commitErrorText("syntax: assignment");
+              commitErrorText_P(MSG_SYNTAX_ASSIGNMENT);
               return true;
             }
           }
 
           varsMask |= (1UL << idxNum);
           vars[idxNum] = val;
-          snprintf(out, sizeof(out), "%ld", val);
+          ltoa(val, out, 10);
           commitTwoGreenText(curLine, out);
           return true;
         }
@@ -1099,7 +2360,7 @@ static bool tryBasicCommand() {
             if (ok) {
               q = qq;
             }
-          } else if (keywordAt(q, "concat")) {
+          } else if (keywordAtP(q, CMD_CONCAT, CMD_CONCAT_LEN)) {
             const char* qq = q;
             ok = parseConcatCall(&qq, tmpStr, sizeof(tmpStr));
             if (ok) {
@@ -1111,16 +2372,16 @@ static bool tryBasicCommand() {
 
           if (!ok) {
             if (parseLastUndefinedStrVar) {
-              commitErrorText("undefined string variable");
+              commitErrorText_P(MSG_UNDEFINED_STR_VAR);
             } else {
-              commitErrorText("syntax: string assignment");
+              commitErrorText_P(MSG_SYNTAX_STR_ASSIGN);
             }
             return true;
           }
 
           skipWs(&q);
           if (*q != '\0') {
-            commitErrorText("syntax: string assignment");
+            commitErrorText_P(MSG_SYNTAX_STR_ASSIGN);
             return true;
           }
 
@@ -1135,29 +2396,29 @@ static bool tryBasicCommand() {
     }
   }
 
-  if (keywordAt(p, "help")) {
-    p += 4;
+  if (keywordAtP(p, CMD_HELP, CMD_HELP_LEN)) {
+    p += CMD_HELP_LEN;
     skipWs(&p);
     if (*p != '\0') {
-      commitErrorText("syntax: help");
+      commitErrorText_P(MSG_SYNTAX_HELP);
       return true;
     }
-    strncpy(out, "cmds: print concat out in high low sum mul sub div restart", MAX_LINE_CHARS);
+    strncpy_P(out, MSG_CMDS_HELP, MAX_LINE_CHARS);
     out[MAX_LINE_CHARS] = '\0';
     commitTwoGreenText(curLine, out);
     return true;
   }
 
-  if (keywordAt(p, "concat")) {
+  if (keywordAtP(p, CMD_CONCAT, CMD_CONCAT_LEN)) {
     char sOut[MAX_LINE_CHARS + 1];
     const char* q = p;
     if (!parseConcatCall(&q, sOut, sizeof(sOut))) {
       if (parseLastUndefinedVar) {
-        commitErrorText("undefined variable");
+        commitErrorText_P(MSG_UNDEFINED_VAR);
       } else if (parseLastUndefinedStrVar) {
-        commitErrorText("undefined string variable");
+        commitErrorText_P(MSG_UNDEFINED_STR_VAR);
       } else {
-        commitErrorText("syntax: concat");
+        commitErrorText_P(MSG_SYNTAX_CONCAT);
       }
       return true;
     }
@@ -1165,11 +2426,11 @@ static bool tryBasicCommand() {
     return true;
   }
 
-  if (keywordAt(p, "print")) {
-    p += 5;
+  if (keywordAtP(p, CMD_PRINT, CMD_PRINT_LEN)) {
+    p += CMD_PRINT_LEN;
     skipWs(&p);
     if (*p != '(') {
-      commitErrorText("syntax: print");
+      commitErrorText_P(MSG_SYNTAX_PRINT);
       return true;
     }
     p++;
@@ -1177,19 +2438,19 @@ static bool tryBasicCommand() {
     if (*p == '"') {
       const char* q = p;
       if (!parseStringLiteral(&q, out, sizeof(out))) {
-        commitErrorText("syntax: print");
+        commitErrorText_P(MSG_SYNTAX_PRINT);
         return true;
       }
       p = q;
-    } else if (keywordAt(p, "concat")) {
+    } else if (keywordAtP(p, CMD_CONCAT, CMD_CONCAT_LEN)) {
       const char* q = p;
       if (!parseConcatCall(&q, out, sizeof(out))) {
         if (parseLastUndefinedVar) {
-          commitErrorText("undefined variable");
+          commitErrorText_P(MSG_UNDEFINED_VAR);
         } else if (parseLastUndefinedStrVar) {
-          commitErrorText("undefined string variable");
+          commitErrorText_P(MSG_UNDEFINED_STR_VAR);
         } else {
-          commitErrorText("syntax: concat");
+          commitErrorText_P(MSG_SYNTAX_CONCAT);
         }
         return true;
       }
@@ -1197,29 +2458,29 @@ static bool tryBasicCommand() {
     } else if (parseStringVarRef(&p, out, sizeof(out))) {
       // parsed as string variable into out
     } else if (parseLastUndefinedStrVar) {
-      commitErrorText("undefined string variable");
+      commitErrorText_P(MSG_UNDEFINED_STR_VAR);
       return true;
     } else {
       long val = 0;
       if (!parseValueToken(&p, &val)) {
         if (parseLastUndefinedVar) {
-          commitErrorText("undefined variable");
+          commitErrorText_P(MSG_UNDEFINED_VAR);
         } else {
-          commitErrorText("syntax: print");
+          commitErrorText_P(MSG_SYNTAX_PRINT);
         }
         return true;
       }
-      snprintf(out, sizeof(out), "%ld", val);
+      ltoa(val, out, 10);
     }
     skipWs(&p);
     if (*p != ')') {
-      commitErrorText("syntax: print");
+      commitErrorText_P(MSG_SYNTAX_PRINT);
       return true;
     }
     p++;
     skipWs(&p);
     if (*p != '\0') {
-      commitErrorText("syntax: print");
+      commitErrorText_P(MSG_SYNTAX_PRINT);
       return true;
     }
     commitTwoGreenText(curLine, out);
@@ -1229,47 +2490,47 @@ static bool tryBasicCommand() {
   long a = 0;
   long b = 0;
 
-  if (keywordAt(p, "sum")) {
-    p += 3;
+  if (keywordAtP(p, CMD_SUM, CMD_SUM_LEN)) {
+    p += CMD_SUM_LEN;
     if (!parseTwoLongs(p, &a, &b)) {
-      commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: sum");
+      commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_SUM);
       return true;
     }
-    snprintf(out, sizeof(out), "%ld", a + b);
+    ltoa(a + b, out, 10);
     commitTwoGreenText(curLine, out);
     return true;
   }
-  if (keywordAt(p, "mul")) {
-    p += 3;
+  if (keywordAtP(p, CMD_MUL, CMD_MUL_LEN)) {
+    p += CMD_MUL_LEN;
     if (!parseTwoLongs(p, &a, &b)) {
-      commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: mul");
+      commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_MUL);
       return true;
     }
-    snprintf(out, sizeof(out), "%ld", a * b);
+    ltoa(a * b, out, 10);
     commitTwoGreenText(curLine, out);
     return true;
   }
-  if (keywordAt(p, "sub")) {
-    p += 3;
+  if (keywordAtP(p, CMD_SUB, CMD_SUB_LEN)) {
+    p += CMD_SUB_LEN;
     if (!parseTwoLongs(p, &a, &b)) {
-      commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: sub");
+      commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_SUB);
       return true;
     }
-    snprintf(out, sizeof(out), "%ld", a - b);
+    ltoa(a - b, out, 10);
     commitTwoGreenText(curLine, out);
     return true;
   }
-  if (keywordAt(p, "div")) {
-    p += 3;
+  if (keywordAtP(p, CMD_DIV, CMD_DIV_LEN)) {
+    p += CMD_DIV_LEN;
     if (!parseTwoLongs(p, &a, &b)) {
-      commitErrorText(parseLastUndefinedVar ? "undefined variable" : "syntax: div");
+      commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_DIV);
       return true;
     }
     if (b == 0) {
-      commitErrorText("division by zero");
+      commitErrorText_P(MSG_DIV_ZERO);
       return true;
     }
-    snprintf(out, sizeof(out), "%ld", a / b);
+    ltoa(a / b, out, 10);
     commitTwoGreenText(curLine, out);
     return true;
   }
@@ -1280,7 +2541,7 @@ static bool tryBasicCommand() {
     if (parseLeadingWord(&q, w, sizeof(w))) {
       skipWs(&q);
       if (*q == '(' && !isKnownCmdWord(w)) {
-        commitErrorText("unknown command");
+        commitErrorText_P(MSG_UNKNOWN_COMMAND);
         return true;
       }
     }
@@ -1344,7 +2605,12 @@ void setup() {
   tft.begin(TFT_SPI_HZ);
   delay(50);
 
+  bcStringReset();
   clear();
+  if (loadBCFromEEPROMIndex(0)) {
+    progNeedsSave = false;
+    commitGreenText_P(MSG_BYTECODE_READY);
+  }
 }
 
 void loop() {
@@ -1358,9 +2624,12 @@ void loop() {
     char c = (char)ci;
 
     if (c == '\r') {
-      continue;
+      c = '\n';
     }
     if (c == '\n') {
+      if (curLen == 0) {
+        continue;
+      }
       curLine[curLen] = '\0';
       if (!tryBasicCommand()) {
         flushCurrentLine();
@@ -1401,4 +2670,5 @@ void loop() {
   if (needEditingPaint) {
     paintEditingRow();
   }
+  vmStep();
 }
