@@ -919,7 +919,7 @@ enum : uint8_t {
   OP_NOP = 0,
   OP_HIGH = 1,
   OP_LOW = 2,
-  OP_SLEEP = 3, // arg in 100ms ticks
+  OP_SLEEP = 3, // arg: milliseconds (0–63, 6-bit field)
   OP_GOTO = 4,  // arg is instruction index
   OP_PRINT = 5, // print line (flush)
   OP_END = 6,
@@ -1293,7 +1293,7 @@ static void vmStep() {
         break;
       }
       vmPC++;
-      vmWaitUntilMs = now + ((uint32_t)arg * 100UL);
+      vmWaitUntilMs = now + (uint32_t)arg;
       break;
     case OP_GOTO:
       if (pCount != 1 || pType != PT_NUM6) {
