@@ -163,6 +163,22 @@ Old v1 images are **migrated** to v2 when autorun is written.
 - **Flash:** the Uno build is **very tight** (~99% of 32 KiB with the current feature set); small changes can break the link step.
 - **RAM:** global buffers for line, history, bytecode, strings, VM print buffer — see `MAX_LINE_CHARS`, `BC_MAX_INS`, `NUM_VARS`, etc.
 
+### Recent size/RAM optimizations (last 10 commits + current tuning)
+
+The codebase has been gradually tuned to keep the Uno build under limits. Key changes:
+
+- **Parser/output deduplication:** repeated command handlers were consolidated (notably pin commands and math commands), reducing duplicated machine code in flash.
+- **Output path cleanup:** serial output was unified behind `serialOutLine(...)` to reduce repeated call patterns and keep code paths simpler.
+- **Feature-growth control:** new features (like EEPROM autorun and extra bytecode tooling) were added with short PROGMEM messages and compact parser branches to reduce flash pressure.
+- **One-line runtime print strategy:** VM print output can be rendered in a single fast row path to avoid expensive full-screen redraw churn during long-running programs.
+- **Tighter helper text:** help and status text was shortened/split to keep diagnostics readable while reducing static string footprint.
+
+Current Uno compile reference (after latest refactors):
+
+- **Flash:** `32184 / 32256 bytes` (~99%)
+- **Global RAM:** `1184 / 2048 bytes` (~57%)
+- **Headroom:** flash is still tight; prefer deduplication and short PROGMEM strings for future changes.
+
 ---
 
 ## Building and uploading
