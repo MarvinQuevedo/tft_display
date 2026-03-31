@@ -462,7 +462,8 @@ static bool lineMaybeBasicCommand(void) {
   if (keywordAt(p, "help") || keywordAt(p, "print") || keywordAt(p, "sum")
       || keywordAt(p, "mul") || keywordAt(p, "sub") || keywordAt(p, "div")
       || keywordAt(p, "concat") || keywordAt(p, "out") || keywordAt(p, "in")
-      || keywordAt(p, "high") || keywordAt(p, "low") || keywordAt(p, "restart")) {
+      || keywordAt(p, "high") || keywordAt(p, "low") || keywordAt(p, "restart")
+      || keywordAt(p, "clear")) {
     return true;
   }
 
@@ -499,7 +500,8 @@ static bool isKnownCmdWord(const char* w) {
   return strcmp(w, "help") == 0 || strcmp(w, "print") == 0 || strcmp(w, "sum") == 0
          || strcmp(w, "mul") == 0 || strcmp(w, "sub") == 0 || strcmp(w, "div") == 0
          || strcmp(w, "concat") == 0 || strcmp(w, "out") == 0 || strcmp(w, "in") == 0
-         || strcmp(w, "high") == 0 || strcmp(w, "low") == 0 || strcmp(w, "restart") == 0;
+         || strcmp(w, "high") == 0 || strcmp(w, "low") == 0 || strcmp(w, "restart") == 0
+         || strcmp(w, "clear") == 0;
 }
 
 static bool isTftReservedPin(uint8_t pin) {
@@ -519,7 +521,7 @@ static bool isTftReservedPin(uint8_t pin) {
   }
 }
 
-static void restartTerminal() {
+static void clear() {
   // Limpieza global de la pantalla y estado del terminal.
   tft.setRotation(TFT_ROTATION);
   if (CLEAR_BLACK_ALL_ROTATIONS) {
@@ -538,8 +540,8 @@ static void restartTerminal() {
   curLine[0] = '\0';
   rowCount = 0;
 
-  paintRowAt(0, "TFT Serial terminal", ILI9341_GREEN);
-  histPush("TFT Serial terminal");
+  paintRowAt(0, "UNO Terminal", ILI9341_GREEN);
+  histPush("UNO Terminal");
   paintRowAt(1, "115200 baud", ILI9341_GREEN);
   histPush("115200 baud");
   {
@@ -561,6 +563,10 @@ static void restartTerminal() {
   }
   rowCount = 3;
   paintEditingRow();
+}
+
+static void restartTerminal() {
+  clear();
 }
 
 /** Mensaje de error en rojo; siempre Serial + TFT (antes se perdía TFT si rowCount >= maxR). */
@@ -734,6 +740,28 @@ static bool tryBasicCommand() {
     }
     restartTerminal();
     Serial.println(F("restarted"));
+    return true;
+  }
+
+  // clear: clears TFT and re-initializes terminal state
+  if (keywordAt(p, "clear")) {
+    p += 5;
+    skipWs(&p);
+    // allow optional parentheses: clear()
+    if (*p == '(') {
+      p++;
+      skipWs(&p);
+      if (*p == ')') {
+        p++;
+      }
+      skipWs(&p);
+    }
+    if (*p != '\0') {
+      commitErrorText("syntax: clear");
+      return true;
+    }
+    clear();
+    Serial.println(F("cleared"));
     return true;
   }
 
@@ -1319,46 +1347,7 @@ void setup() {
   tft.begin(TFT_SPI_HZ);
   delay(50);
 
-  tft.setRotation(TFT_ROTATION);
-  if (CLEAR_BLACK_ALL_ROTATIONS) {
-    clearAllRotationsBlack();
-    tft.setRotation(TFT_ROTATION);
-  }
-  tft.fillScreen(ILI9341_BLACK);
-
-  memset(hist, 0, sizeof(hist));
-  varsMask = 0;
-  // vars[] no hace falta, pero lo dejamos limpio.
-  memset(vars, 0, sizeof(vars));
-  strVarsMask = 0;
-  memset(strVars, 0, sizeof(strVars));
-  curLen = 0;
-  curLine[0] = '\0';
-  rowCount = 0;
-
-  paintRowAt(0, "UNO Terminal", ILI9341_GREEN);
-  histPush("UNO Terminal");
-  paintRowAt(1, "115200 baud", ILI9341_GREEN);
-  histPush("115200 baud");
-  {
-    char info[16];
-    uint8_t c = termCols();
-    uint8_t m = termMaxLines();
-    info[0] = 'c';
-    info[1] = '=';
-    info[2] = (char)('0' + (c / 10));
-    info[3] = (char)('0' + (c % 10));
-    info[4] = ' ';
-    info[5] = 'm';
-    info[6] = '=';
-    info[7] = (char)('0' + (m / 10));
-    info[8] = (char)('0' + (m % 10));
-    info[9] = '\0';
-    paintRowAt(2, info, ILI9341_GREEN);
-    histPush(info);
-  }
-  rowCount = 3;
-  paintEditingRow();
+  clear();
 }
 
 void loop() {
