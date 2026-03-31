@@ -162,6 +162,8 @@ CMD_DECL(CMD_AUTORUN, "autorun");
 CMD_DECL(CMD_OFF, "off");
 CMD_DECL(CMD_ON, "on");
 CMD_DECL(CMD_LET, "let");
+CMD_DECL(CMD_STATUS, "status");
+CMD_DECL(CMD_EXIT, "exit");
 
 MSG_DECL(MSG_VM_BAD_PARAMS, "vm bad params");
 MSG_DECL(MSG_VM_GOTO_OOR, "vm goto out range");
@@ -226,13 +228,69 @@ MSG_DECL(MSG_AUTORUN_SET, "autorun saved");
 MSG_DECL(MSG_AUTORUN_BAD_INDEX, "autorun: bad program index");
 MSG_DECL(MSG_AUTORUN_FAIL, "autorun save failed");
 MSG_DECL(MSG_SYNTAX_AUTORUN, "syntax: autorun | autorun off | autorun on [n]");
-MSG_DECL(MSG_CMDS_HELP, "cmds: bcsave bclist bcdump run load autorun");
+MSG_DECL(MSG_CMDS_HELP_1, "cmds: run stop load bc bcx");
+MSG_DECL(MSG_CMDS_HELP_2, "      bcstr bcsave bclist");
 MSG_DECL(MSG_SYNTAX_SUM, "syntax: sum");
 MSG_DECL(MSG_SYNTAX_MUL, "syntax: mul");
 MSG_DECL(MSG_SYNTAX_SUB, "syntax: sub");
 MSG_DECL(MSG_SYNTAX_DIV, "syntax: div");
+MSG_DECL(MSG_STATUS_HINT, "status: exit");
 
 static char flashMsgBuf[MAX_LINE_CHARS + 1];
+static bool statusMode = false;
+static uint32_t statusNextMs = 0;
+static uint32_t statusLastLoopMs = 0;
+static uint16_t statusLoopTicks = 0;
+static uint16_t statusLoopHz = 0;
+
+extern int __heap_start;
+extern void* __brkval;
+
+static int freeRamBytes() {
+  int v;
+  return (int)&v - ((__brkval == 0) ? (int)&__heap_start : (int)__brkval);
+}
+
+static void statusModeEnter() {
+  statusMode = true;
+  statusNextMs = 0;
+  statusLastLoopMs = millis();
+  statusLoopTicks = 0;
+  statusLoopHz = 0;
+  serialOutLine("status on");
+}
+
+static void statusModeExit() {
+  statusMode = false;
+  serialOutLine("status off");
+  paintEditingRow();
+}
+
+static void statusModeTick() {
+  if (!statusMode) {
+    return;
+  }
+  uint32_t now = millis();
+  statusLoopTicks++;
+  if ((uint32_t)(now - statusLastLoopMs) >= 1000UL) {
+    statusLoopHz = statusLoopTicks;
+    statusLoopTicks = 0;
+    statusLastLoopMs = now;
+  }
+  if (statusNextMs != 0 && (int32_t)(now - statusNextMs) < 0) {
+    return;
+  }
+  statusNextMs = now + 250UL;
+
+  char line[MAX_LINE_CHARS + 1];
+  line[0] = '\0';
+  strcat(line, "CPU:");
+  catU32(line, statusLoopHz);
+  strcat(line, " RAM:");
+  catU32(line, (uint32_t)freeRamBytes());
+  strcat(line, " ROM:32K");
+  paintRowAt(0, line, ILI9341_CYAN);
+}
 
 /** Append decimal u32 to buf (buf must be a valid C string). Avoids snprintf/printf on AVR. */
 static void catU32(char* buf, uint32_t v) {
@@ -648,7 +706,8 @@ static bool lineMaybeBasicCommand(void) {
       || keywordAtP(p, CMD_BCSAVE, CMD_BCSAVE_LEN) || keywordAtP(p, CMD_BCLIST, CMD_BCLIST_LEN)
       || keywordAtP(p, CMD_BCDUMP, CMD_BCDUMP_LEN) || keywordAtP(p, CMD_PLIST, CMD_PLIST_LEN)
       || keywordAtP(p, CMD_EPERASE, CMD_EPERASE_LEN)
-      || keywordAtP(p, CMD_AUTORUN, CMD_AUTORUN_LEN)) {
+      || keywordAtP(p, CMD_AUTORUN, CMD_AUTORUN_LEN)
+      || keywordAtP(p, CMD_STATUS, CMD_STATUS_LEN) || keywordAtP(p, CMD_EXIT, CMD_EXIT_LEN)) {
     return true;
   }
 
@@ -693,7 +752,8 @@ static bool isKnownCmdWord(const char* w) {
          || strcmp_P(w, CMD_BCSAVE) == 0 || strcmp_P(w, CMD_BCLIST) == 0 || strcmp_P(w, CMD_BCDUMP) == 0
          || strcmp_P(w, CMD_PLIST) == 0
          || strcmp_P(w, CMD_EPERASE) == 0
-         || strcmp_P(w, CMD_AUTORUN) == 0;
+         || strcmp_P(w, CMD_AUTORUN) == 0
+         || strcmp_P(w, CMD_STATUS) == 0 || strcmp_P(w, CMD_EXIT) == 0;
 }
 
 static bool isTftReservedPin(uint8_t pin) {
@@ -850,6 +910,14 @@ static void commitGreenText(const char* tmp) {
   paintEditingRow();
 }
 
+/** Salida rápida para prints en ejecución: dibuja siempre en una sola fila, sin scroll global. */
+static void commitPrintFastText(const char* msg) {
+  serialOutLine(msg);
+  uint8_t maxR = termMaxLines();
+  uint8_t row = (rowCount < maxR) ? rowCount : (uint8_t)(maxR - 1);
+  paintRowAt(row, msg, ILI9341_GREEN);
+}
+
 /** Commit de 2 líneas verdes seguidas (cmd + resultado).
  *  Esto evita que, si estabas casi al límite, el primer commit se pierda
  *  por un reset entre líneas. */
@@ -943,6 +1011,99 @@ static bool parseTwoLongsAndAdvance(const char* p, const char** outEnd, long* a,
   q++;
   skipWs(&q);
   *outEnd = q;
+  return true;
+}
+
+enum : uint8_t {
+  PIN_CMD_OUT = 0,
+  PIN_CMD_IN = 1,
+  PIN_CMD_HIGH = 2,
+  PIN_CMD_LOW = 3
+};
+
+static bool runPinCommand(const char* p, PGM_P syntaxMsg, uint8_t pinCmdKind) {
+  skipWs(&p);
+  if (*p != '(') {
+    commitErrorText_P(syntaxMsg);
+    return true;
+  }
+  p++;
+  long pin = 0;
+  if (!parseValueToken(&p, &pin)) {
+    commitErrorText_P(syntaxMsg);
+    return true;
+  }
+  skipWs(&p);
+  if (*p != ')') {
+    commitErrorText_P(syntaxMsg);
+    return true;
+  }
+  p++;
+  skipWs(&p);
+  if (*p != '\0') {
+    commitErrorText_P(syntaxMsg);
+    return true;
+  }
+  if (pin < 0 || pin > 19) {
+    commitErrorText_P(MSG_PIN_OOR);
+    return true;
+  }
+  if (isTftReservedPin((uint8_t)pin)) {
+    commitErrorText_P(MSG_PIN_RESERVED);
+    return true;
+  }
+
+  uint8_t upin = (uint8_t)pin;
+  if (pinCmdKind == PIN_CMD_OUT) {
+    pinMode(upin, OUTPUT);
+    commitTwoGreenTextSecond_P(curLine, MSG_OK);
+    return true;
+  }
+  if (pinCmdKind == PIN_CMD_IN) {
+    pinMode(upin, INPUT);
+    commitTwoGreenTextSecond_P(curLine, MSG_OK);
+    return true;
+  }
+  if (pinCmdKind == PIN_CMD_HIGH) {
+    digitalWrite(upin, HIGH);
+    commitTwoGreenTextSecond_P(curLine, MSG_HIGH_TXT);
+    return true;
+  }
+  digitalWrite(upin, LOW);
+  commitTwoGreenTextSecond_P(curLine, MSG_LOW_TXT);
+  return true;
+}
+
+enum : uint8_t {
+  BINOP_SUM = 0,
+  BINOP_MUL = 1,
+  BINOP_SUB = 2,
+  BINOP_DIV = 3
+};
+
+static bool runBinaryMathCommand(const char* p, PGM_P syntaxMsg, uint8_t opKind, char* out) {
+  long a = 0;
+  long b = 0;
+  if (!parseTwoLongs(p, &a, &b)) {
+    commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : syntaxMsg);
+    return true;
+  }
+  long r = 0;
+  if (opKind == BINOP_SUM) {
+    r = a + b;
+  } else if (opKind == BINOP_MUL) {
+    r = a * b;
+  } else if (opKind == BINOP_SUB) {
+    r = a - b;
+  } else {
+    if (b == 0) {
+      commitErrorText_P(MSG_DIV_ZERO);
+      return true;
+    }
+    r = a / b;
+  }
+  ltoa(r, out, 10);
+  commitTwoGreenText(curLine, out);
   return true;
 }
 
@@ -1452,9 +1613,9 @@ static void vmStep() {
         break;
       }
       if (vmPrintLen == 0) {
-        commitGreenText("");
+        commitPrintFastText("");
       } else {
-        commitGreenText(vmPrintBuf);
+        commitPrintFastText(vmPrintBuf);
         vmPrintBufClear();
       }
       vmPC++;
@@ -1467,7 +1628,7 @@ static void vmStep() {
         break;
       }
       if (vmPrintLen > 0) {
-        commitGreenText(vmPrintBuf);
+        commitPrintFastText(vmPrintBuf);
         vmPrintBufClear();
       }
       vmStop();
@@ -1643,6 +1804,34 @@ static bool tryBasicCommand() {
   }
 
   char out[MAX_LINE_CHARS + 1];
+
+  if (keywordAtP(p, CMD_EXIT, CMD_EXIT_LEN)) {
+    p += CMD_EXIT_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_UNKNOWN_COMMAND);
+      return true;
+    }
+    if (statusMode) {
+      statusModeExit();
+      commitGreenText_P(MSG_OK);
+    } else {
+      commitWarnText_P(MSG_STATUS_HINT);
+    }
+    return true;
+  }
+
+  if (keywordAtP(p, CMD_STATUS, CMD_STATUS_LEN)) {
+    p += CMD_STATUS_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_UNKNOWN_COMMAND);
+      return true;
+    }
+    statusModeEnter();
+    commitGreenText_P(MSG_OK);
+    return true;
+  }
 
   if (keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)) {
     p += CMD_BCCLR_LEN;
@@ -2201,150 +2390,22 @@ static bool tryBasicCommand() {
   //   low(pin)  -> digitalWrite(pin, LOW)
   if (keywordAtP(p, CMD_OUT, CMD_OUT_LEN)) {
     p += CMD_OUT_LEN;
-    skipWs(&p);
-    if (*p != '(') {
-      commitErrorText_P(MSG_SYNTAX_OUT);
-      return true;
-    }
-    p++;
-    long pin = 0;
-    if (!parseValueToken(&p, &pin)) {
-      commitErrorText_P(MSG_SYNTAX_OUT);
-      return true;
-    }
-    skipWs(&p);
-    if (*p != ')') {
-      commitErrorText_P(MSG_SYNTAX_OUT);
-      return true;
-    }
-    p++;
-    skipWs(&p);
-    if (*p != '\0') {
-      commitErrorText_P(MSG_SYNTAX_OUT);
-      return true;
-    }
-    if (pin < 0 || pin > 19) {
-      commitErrorText_P(MSG_PIN_OOR);
-      return true;
-    }
-    if (isTftReservedPin((uint8_t)pin)) {
-      commitErrorText_P(MSG_PIN_RESERVED);
-      return true;
-    }
-    pinMode((uint8_t)pin, OUTPUT);
-    commitTwoGreenTextSecond_P(curLine, MSG_OK);
-    return true;
+    return runPinCommand(p, MSG_SYNTAX_OUT, PIN_CMD_OUT);
   }
 
   if (keywordAtP(p, CMD_IN, CMD_IN_LEN)) {
     p += CMD_IN_LEN;
-    skipWs(&p);
-    if (*p != '(') {
-      commitErrorText_P(MSG_SYNTAX_IN);
-      return true;
-    }
-    p++;
-    long pin = 0;
-    if (!parseValueToken(&p, &pin)) {
-      commitErrorText_P(MSG_SYNTAX_IN);
-      return true;
-    }
-    skipWs(&p);
-    if (*p != ')') {
-      commitErrorText_P(MSG_SYNTAX_IN);
-      return true;
-    }
-    p++;
-    skipWs(&p);
-    if (*p != '\0') {
-      commitErrorText_P(MSG_SYNTAX_IN);
-      return true;
-    }
-    if (pin < 0 || pin > 19) {
-      commitErrorText_P(MSG_PIN_OOR);
-      return true;
-    }
-    if (isTftReservedPin((uint8_t)pin)) {
-      commitErrorText_P(MSG_PIN_RESERVED);
-      return true;
-    }
-    pinMode((uint8_t)pin, INPUT);
-    commitTwoGreenTextSecond_P(curLine, MSG_OK);
-    return true;
+    return runPinCommand(p, MSG_SYNTAX_IN, PIN_CMD_IN);
   }
 
   if (keywordAtP(p, CMD_HIGH, CMD_HIGH_LEN)) {
     p += CMD_HIGH_LEN;
-    skipWs(&p);
-    if (*p != '(') {
-      commitErrorText_P(MSG_SYNTAX_HIGH);
-      return true;
-    }
-    p++;
-    long pin = 0;
-    if (!parseValueToken(&p, &pin)) {
-      commitErrorText_P(MSG_SYNTAX_HIGH);
-      return true;
-    }
-    skipWs(&p);
-    if (*p != ')') {
-      commitErrorText_P(MSG_SYNTAX_HIGH);
-      return true;
-    }
-    p++;
-    skipWs(&p);
-    if (*p != '\0') {
-      commitErrorText_P(MSG_SYNTAX_HIGH);
-      return true;
-    }
-    if (pin < 0 || pin > 19) {
-      commitErrorText_P(MSG_PIN_OOR);
-      return true;
-    }
-    if (isTftReservedPin((uint8_t)pin)) {
-      commitErrorText_P(MSG_PIN_RESERVED);
-      return true;
-    }
-    digitalWrite((uint8_t)pin, HIGH);
-    commitTwoGreenTextSecond_P(curLine, MSG_HIGH_TXT);
-    return true;
+    return runPinCommand(p, MSG_SYNTAX_HIGH, PIN_CMD_HIGH);
   }
 
   if (keywordAtP(p, CMD_LOW, CMD_LOW_LEN)) {
     p += CMD_LOW_LEN;
-    skipWs(&p);
-    if (*p != '(') {
-      commitErrorText_P(MSG_SYNTAX_LOW);
-      return true;
-    }
-    p++;
-    long pin = 0;
-    if (!parseValueToken(&p, &pin)) {
-      commitErrorText_P(MSG_SYNTAX_LOW);
-      return true;
-    }
-    skipWs(&p);
-    if (*p != ')') {
-      commitErrorText_P(MSG_SYNTAX_LOW);
-      return true;
-    }
-    p++;
-    skipWs(&p);
-    if (*p != '\0') {
-      commitErrorText_P(MSG_SYNTAX_LOW);
-      return true;
-    }
-    if (pin < 0 || pin > 19) {
-      commitErrorText_P(MSG_PIN_OOR);
-      return true;
-    }
-    if (isTftReservedPin((uint8_t)pin)) {
-      commitErrorText_P(MSG_PIN_RESERVED);
-      return true;
-    }
-    digitalWrite((uint8_t)pin, LOW);
-    commitTwoGreenTextSecond_P(curLine, MSG_LOW_TXT);
-    return true;
+    return runPinCommand(p, MSG_SYNTAX_LOW, PIN_CMD_LOW);
   }
 
   // Assignment: A=123, V12=123, A$="hi", S0$="hi"
@@ -2567,9 +2628,8 @@ static bool tryBasicCommand() {
       commitErrorText_P(MSG_SYNTAX_HELP);
       return true;
     }
-    strncpy_P(out, MSG_CMDS_HELP, MAX_LINE_CHARS);
-    out[MAX_LINE_CHARS] = '\0';
-    commitTwoGreenText(curLine, out);
+    commitTwoGreenTextSecond_P(curLine, MSG_CMDS_HELP_1);
+    commitGreenText_P(MSG_CMDS_HELP_2);
     return true;
   }
 
@@ -2651,52 +2711,21 @@ static bool tryBasicCommand() {
     return true;
   }
 
-  long a = 0;
-  long b = 0;
-
   if (keywordAtP(p, CMD_SUM, CMD_SUM_LEN)) {
     p += CMD_SUM_LEN;
-    if (!parseTwoLongs(p, &a, &b)) {
-      commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_SUM);
-      return true;
-    }
-    ltoa(a + b, out, 10);
-    commitTwoGreenText(curLine, out);
-    return true;
+    return runBinaryMathCommand(p, MSG_SYNTAX_SUM, BINOP_SUM, out);
   }
   if (keywordAtP(p, CMD_MUL, CMD_MUL_LEN)) {
     p += CMD_MUL_LEN;
-    if (!parseTwoLongs(p, &a, &b)) {
-      commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_MUL);
-      return true;
-    }
-    ltoa(a * b, out, 10);
-    commitTwoGreenText(curLine, out);
-    return true;
+    return runBinaryMathCommand(p, MSG_SYNTAX_MUL, BINOP_MUL, out);
   }
   if (keywordAtP(p, CMD_SUB, CMD_SUB_LEN)) {
     p += CMD_SUB_LEN;
-    if (!parseTwoLongs(p, &a, &b)) {
-      commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_SUB);
-      return true;
-    }
-    ltoa(a - b, out, 10);
-    commitTwoGreenText(curLine, out);
-    return true;
+    return runBinaryMathCommand(p, MSG_SYNTAX_SUB, BINOP_SUB, out);
   }
   if (keywordAtP(p, CMD_DIV, CMD_DIV_LEN)) {
     p += CMD_DIV_LEN;
-    if (!parseTwoLongs(p, &a, &b)) {
-      commitErrorText_P(parseLastUndefinedVar ? MSG_UNDEFINED_VAR : MSG_SYNTAX_DIV);
-      return true;
-    }
-    if (b == 0) {
-      commitErrorText_P(MSG_DIV_ZERO);
-      return true;
-    }
-    ltoa(a / b, out, 10);
-    commitTwoGreenText(curLine, out);
-    return true;
+    return runBinaryMathCommand(p, MSG_SYNTAX_DIV, BINOP_DIV, out);
   }
 
   {
@@ -2809,12 +2838,17 @@ void loop() {
       }
       curLine[curLen] = '\0';
       if (!tryBasicCommand()) {
-        flushCurrentLine();
-        needEditingPaint = false;
+        if (!statusMode) {
+          flushCurrentLine();
+          needEditingPaint = false;
+        } else {
+          curLen = 0;
+          curLine[0] = '\0';
+        }
       } else {
         curLen = 0;
         curLine[0] = '\0';
-        needEditingPaint = true;
+        needEditingPaint = !statusMode;
       }
       continue;
     }
@@ -2822,7 +2856,7 @@ void loop() {
       if (curLen > 0) {
         curLen--;
         curLine[curLen] = '\0';
-        needEditingPaint = true;
+        needEditingPaint = !statusMode;
       }
       continue;
     }
@@ -2840,12 +2874,13 @@ void loop() {
     if (curLen < MAX_LINE_CHARS - 1) {
       curLine[curLen++] = c;
       curLine[curLen] = '\0';
-      needEditingPaint = true;
+      needEditingPaint = !statusMode;
     }
   }
 
-  if (needEditingPaint) {
+  if (needEditingPaint && !statusMode) {
     paintEditingRow();
   }
+  statusModeTick();
   vmStep();
 }

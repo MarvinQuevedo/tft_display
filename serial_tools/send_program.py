@@ -4,9 +4,11 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from typing import Optional
 
 try:
     import serial
+    from serial.tools import list_ports
 except ImportError:
     print("Missing dependency: pyserial")
     print("Install with: pip install pyserial")
@@ -21,15 +23,51 @@ BLINK_PIN = 2
 PROGRAM_LINES = [
     "eperase",
     "bcclr",
-    'bcstr("Starting")',
-    "bcx(5,2,0)",
-    f"bc(high,{BLINK_PIN})",
-    "bc(sleep,100)",
-    f"bc(low,{BLINK_PIN})",
-    "bc(sleep,100)",
-    "bc(goto,1)",
+    'bcstr("GREEN ")',   # str#0
+    'bcstr("YELLOW ")',  # str#1
+    'bcstr("RED ")',     # str#2
+
+    # GREEN (pin 2): 3..1
+    "bc(high,2)",
+    "bc(low,3)",
+    "bc(low,4)",
+    "bcx(7,2,0)",
+    "bcx(5,1,3)",
+    "bc(sleeps,1)",
+    "bcx(7,2,0)",
+    "bcx(5,1,2)",
+    "bc(sleeps,1)",
+    "bcx(7,2,0)",
+    "bcx(5,1,1)",
+    "bc(sleeps,1)",
+
+    # YELLOW (pin 3): 1
+    "bc(low,2)",
+    "bc(high,3)",
+    "bc(low,4)",
+    "bcx(7,2,1)",
+    "bcx(5,1,1)",
+    "bc(sleeps,1)",
+
+    # RED (pin 4): 3..1
+    "bc(low,2)",
+    "bc(low,3)",
+    "bc(high,4)",
+    "bcx(7,2,2)",
+    "bcx(5,1,3)",
+    "bc(sleeps,1)",
+    "bcx(7,2,2)",
+    "bcx(5,1,2)",
+    "bc(sleeps,1)",
+    "bcx(7,2,2)",
+    "bcx(5,1,1)",
+    "bc(sleeps,1)",
+
+    "bc(goto,0)",
     "bcsave",
-    "run(0)",
+    "autorun on 0",
+    "reboot",
+    
 ]
 
 
@@ -59,9 +97,45 @@ def read_response(
     return "".join(chunks)
 
 
+def list_arduino_ports():
+    ports = list(list_ports.comports())
+    ranked = []
+    for p in ports:
+        hay = f"{p.device} {p.description} {p.manufacturer or ''}".lower()
+        score = 1
+        if "arduino" in hay or "usbmodem" in hay or "wch" in hay or "cp210" in hay or "ch340" in hay:
+            score = 0
+        ranked.append((score, p))
+    ranked.sort(key=lambda x: (x[0], x[1].device))
+    return [p for _, p in ranked]
+
+
+def choose_port(explicit: Optional[str]) -> Optional[str]:
+    if explicit:
+        return explicit
+    ports = list_arduino_ports()
+    if not ports:
+        print("[error] no se detectaron puertos serie.")
+        return None
+    print("Puertos disponibles:")
+    for i, p in enumerate(ports, start=1):
+        desc = p.description or "sin descripcion"
+        mf = f" | {p.manufacturer}" if p.manufacturer else ""
+        print(f"  {i}) {p.device} - {desc}{mf}")
+    while True:
+        raw = input("Elige puerto [numero] (o 'q' para salir): ").strip().lower()
+        if raw in ("q", "quit", "exit"):
+            return None
+        if raw.isdigit():
+            idx = int(raw)
+            if 1 <= idx <= len(ports):
+                return ports[idx - 1].device
+        print("Seleccion invalida.")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Send TFT bytecode test program via serial")
-    parser.add_argument("--port", required=True, help="Serial port, e.g. /dev/cu.usbmodem1101")
+    parser.add_argument("--port", help="Serial port, e.g. /dev/cu.usbmodem1101")
     parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
     parser.add_argument("--line-delay", type=float, default=0.12, help="Delay between lines in seconds")
     parser.add_argument(
@@ -84,9 +158,12 @@ def main() -> int:
     )
     parser.add_argument("--initial-wait", type=float, default=1.8, help="Wait after opening port (seconds)")
     args = parser.parse_args()
+    port = choose_port(args.port)
+    if not port:
+        return 1
 
-    print(f"Opening {args.port} @ {args.baud}...")
-    with serial.Serial(args.port, args.baud, timeout=0.05) as ser:
+    print(f"Opening {port} @ {args.baud}...")
+    with serial.Serial(port, args.baud, timeout=0.05) as ser:
         time.sleep(args.initial_wait)
         ser.reset_input_buffer()
 
