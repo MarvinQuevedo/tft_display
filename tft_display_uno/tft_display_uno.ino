@@ -18,7 +18,7 @@
  * Librerías: Adafruit ILI9341 + Adafruit GFX
  *
  * Mini-BASIC (una línea, Enter): se intenta antes de guardar texto normal.
- *   print("hola")   sum(12, 23)   mul(2, 3)   sub(10, 4)   div(20, 4)   help
+ *   print("hola")   sum(12, 23)   mul(2, 3)   sub(10, 4)   div(20, 4)   help   reboot
  * Errores BASIC: mensaje rojo + Serial (inglés: unknown command, syntax: …).
  * Línea que parece BASIC: no se parte en verde al escribir; al Enter solo salida.
  */
@@ -144,6 +144,7 @@ CMD_DECL(CMD_NOP, "nop");
 CMD_DECL(CMD_END, "end");
 CMD_DECL(CMD_PUT, "put");
 CMD_DECL(CMD_RESTART, "restart");
+CMD_DECL(CMD_REBOOT, "reboot");
 CMD_DECL(CMD_CLEAR, "clear");
 CMD_DECL(CMD_RUN, "run");
 CMD_DECL(CMD_STOP, "stop");
@@ -640,6 +641,7 @@ static bool lineMaybeBasicCommand(void) {
       || keywordAtP(p, CMD_MUL, CMD_MUL_LEN) || keywordAtP(p, CMD_SUB, CMD_SUB_LEN) || keywordAtP(p, CMD_DIV, CMD_DIV_LEN)
       || keywordAtP(p, CMD_CONCAT, CMD_CONCAT_LEN) || keywordAtP(p, CMD_OUT, CMD_OUT_LEN) || keywordAtP(p, CMD_IN, CMD_IN_LEN)
       || keywordAtP(p, CMD_HIGH, CMD_HIGH_LEN) || keywordAtP(p, CMD_LOW, CMD_LOW_LEN)       || keywordAtP(p, CMD_RESTART, CMD_RESTART_LEN)
+      || keywordAtP(p, CMD_REBOOT, CMD_REBOOT_LEN)
       || keywordAtP(p, CMD_CLEAR, CMD_CLEAR_LEN) || keywordAtP(p, CMD_RUN, CMD_RUN_LEN) || keywordAtP(p, CMD_STOP, CMD_STOP_LEN)
       || keywordAtP(p, CMD_LOAD, CMD_LOAD_LEN) || keywordAtP(p, CMD_BC, CMD_BC_LEN) || keywordAtP(p, CMD_BCX, CMD_BCX_LEN)
       || keywordAtP(p, CMD_BCSTR, CMD_BCSTR_LEN) || keywordAtP(p, CMD_BCCLR, CMD_BCCLR_LEN)
@@ -684,6 +686,7 @@ static bool isKnownCmdWord(const char* w) {
          || strcmp_P(w, CMD_MUL) == 0 || strcmp_P(w, CMD_SUB) == 0 || strcmp_P(w, CMD_DIV) == 0
          || strcmp_P(w, CMD_CONCAT) == 0 || strcmp_P(w, CMD_OUT) == 0 || strcmp_P(w, CMD_IN) == 0
          || strcmp_P(w, CMD_HIGH) == 0 || strcmp_P(w, CMD_LOW) == 0 || strcmp_P(w, CMD_RESTART) == 0
+         || strcmp_P(w, CMD_REBOOT) == 0
          || strcmp_P(w, CMD_CLEAR) == 0 || strcmp_P(w, CMD_RUN) == 0 || strcmp_P(w, CMD_STOP) == 0
          || strcmp_P(w, CMD_LOAD) == 0 || strcmp_P(w, CMD_BC) == 0 || strcmp_P(w, CMD_BCX) == 0
          || strcmp_P(w, CMD_BCSTR) == 0 || strcmp_P(w, CMD_BCCLR) == 0
@@ -763,6 +766,13 @@ static void clear() {
 
 static void restartTerminal() {
   clear();
+}
+
+/** Full MCU reset (jump to reset vector — same net effect as the physical reset button). */
+static void rebootMCU(void) {
+  Serial.flush();
+  void (*resetFunc)(void) = 0;
+  resetFunc();
 }
 
 /** Mensaje en TFT + Serial (color configurable). */
@@ -2148,6 +2158,18 @@ static bool tryBasicCommand() {
       return true;
     }
     restartTerminal();
+    return true;
+  }
+
+  // reboot: jump to reset vector — full Arduino restart (like the reset button)
+  if (keywordAtP(p, CMD_REBOOT, CMD_REBOOT_LEN)) {
+    p += CMD_REBOOT_LEN;
+    skipWs(&p);
+    if (*p != '\0') {
+      commitErrorText_P(MSG_UNKNOWN_COMMAND);
+      return true;
+    }
+    rebootMCU();
     return true;
   }
 
