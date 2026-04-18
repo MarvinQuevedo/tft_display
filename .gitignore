@@ -1,0 +1,8 @@
+# Credenciales WiFi y secretos
+**/secrets.h
+
+# Build artifacts de Arduino-CLI
+build/
+*.bin
+*.hex
+*.elf
