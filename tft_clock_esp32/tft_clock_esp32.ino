@@ -27,8 +27,10 @@
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
-const uint32_t WEATHER_TTL    = 10UL * 60UL * 1000UL;
-const uint32_t CITY_SWITCH_MS = 15000UL;
+const uint32_t WEATHER_TTL      = 10UL * 60UL * 1000UL;
+const uint32_t WEATHER_RETRY_MS = 30UL * 1000UL;   // reintento si datos inválidos
+const uint32_t CITY_SWITCH_MS   = 15000UL;
+const uint32_t WIFI_RETRY_MS    = 5UL * 1000UL;    // intervalo entre intentos WiFi
 
 // ---- Ciudades fijas ----
 struct CityDef { const char* name; float lat, lon; };
@@ -43,6 +45,7 @@ static int32_t utcOffsetSec = -21600;  // GMT-6 El Salvador
 struct Weather {
     bool     valid;
     uint32_t lastFetchMs;
+    uint32_t lastAttemptMs;   // última vez que se intentó (exitoso o no)
     float    tempNow, tempMin, tempMax;
     int16_t  codeNow, precipMaxPct, windDir;
     float    windSpeed;
@@ -76,6 +79,7 @@ const int16_t CLOCK_LEFT  = (SCR_W - 8 * 36) / 2;   // 16
 // ---- Colores ----
 uint16_t COL_TEXT, COL_DIM, COL_TIME, COL_DATE, COL_HOT, COL_COLD,
          COL_RAIN, COL_SUN, COL_CLOUD, COL_ACCENT;
+uint16_t COL_PROMPT, COL_CMD, COL_LABEL, COL_VAL, COL_OK, COL_ERR, COL_TITLE;
 
 const char* DAYS_ES[7]    = { "Domingo","Lunes","Martes","Miercoles","Jueves","Viernes","Sabado" };
 const char* MONTHS_ES[12] = { "ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic" };
@@ -115,6 +119,8 @@ static bool fetchWeather(uint8_t idx) {
         "&hourly=temperature_2m,precipitation_probability"
         "&forecast_days=1&timezone=auto",
         CITIES[idx].lat, CITIES[idx].lon);
+
+    cityWeather[idx].lastAttemptMs = millis();
 
     String body;
     if (!httpsGet(url, body)) return false;
@@ -167,13 +173,27 @@ static bool fetchWeather(uint8_t idx) {
 
 // ---------- NTP ----------
 static bool syncTime() {
+    uint32_t t0 = millis();
     configTime(utcOffsetSec, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
     struct tm t;
     for (int i = 0; i < 20 && !getLocalTime(&t, 500); i++) Serial.print(".");
     timeOk = getLocalTime(&t, 100);
-    if (timeOk) Serial.printf("NTP OK %02d:%02d:%02d\n", t.tm_hour, t.tm_min, t.tm_sec);
-    else         Serial.println("NTP FAIL");
-    return timeOk;
+    uint32_t elapsed = millis() - t0;
+
+    if (!timeOk) { Serial.println("NTP FAIL"); return false; }
+
+    // Leer fracción de segundo actual con microsegundos
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    uint32_t msIntoSec  = tv.tv_usec / 1000;
+    uint32_t msToNextSec = 1000 - msIntoSec;
+
+    Serial.printf("NTP OK %02d:%02d:%02d | sync=%lums | en seg=+%lums | espera=%lums\n",
+                  t.tm_hour, t.tm_min, t.tm_sec, elapsed, msIntoSec, msToNextSec);
+
+    // Esperar hasta el siguiente segundo exacto para arrancar display alineado
+    delay(msToNextSec);
+    return true;
 }
 
 // ---------- Weather code → texto ----------
@@ -388,6 +408,54 @@ static void drawWxPanel() {
     }
 }
 
+// Barra de estado al fondo — reemplaza la línea de sol durante errores
+static const char SPINNER[] = "|/-\\";
+static uint8_t spinnerIdx = 0;
+
+static void showStatusBar(const char* msg, uint16_t col) {
+    tft.fillRect(0, SUN_Y-2, SCR_W, 12, ST77XX_BLACK);
+    tft.setTextSize(1); tft.setTextColor(col);
+    tft.setCursor(8, SUN_Y);
+    char buf[48];
+    snprintf(buf, sizeof(buf), "%c %s", SPINNER[spinnerIdx++ & 3], msg);
+    tft.print(buf);
+}
+
+static void clearStatusBar() {
+    tft.fillRect(0, SUN_Y-2, SCR_W, 12, ST77XX_BLACK);
+}
+
+// Reconexión bloqueante — solo actualiza la barra de estado, pantalla intacta
+static void reconnectWiFi() {
+    int attempt = 0;
+    while (WiFi.status() != WL_CONNECTED) {
+        attempt++;
+        char msg[40];
+        snprintf(msg, sizeof(msg), "WiFi... intento #%d", attempt);
+        showStatusBar(msg, COL_ERR);
+        Serial.printf("[WiFi] intento %d\n", attempt);
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASS);
+        uint32_t t0 = millis();
+        while (millis() - t0 < WIFI_RETRY_MS) {
+            if (WiFi.status() == WL_CONNECTED) break;
+            if (timeOk) renderClock();
+            delay(250);
+        }
+    }
+    wifiOk = true;
+    Serial.printf("[WiFi] reconectado IP=%s\n", WiFi.localIP().toString().c_str());
+    clearStatusBar();
+    syncTime();
+    for (uint8_t i = 0; i < 3; i++) {
+        cityWeather[i].valid = false;
+        cityWeather[i].lastAttemptMs = 0;
+    }
+    fetchWeather(cityIdx);
+    lastCitySwitch = millis();
+    redrawAll();
+}
+
 static void redrawAll() {
     tft.fillScreen(ST77XX_BLACK);
     drawHeader();
@@ -401,7 +469,6 @@ static void redrawAll() {
 static int16_t conY = 0;
 static const int16_t CON_LEFT   = 6;
 static const int16_t CON_LINE_H = 9;
-static uint16_t COL_PROMPT, COL_CMD, COL_LABEL, COL_VAL, COL_OK, COL_ERR, COL_TITLE;
 
 static void conPrint(uint16_t col, int16_t indent, const char* text) {
     tft.setTextSize(1); tft.setTextColor(col);
@@ -476,9 +543,14 @@ void setup() {
     conKV("ssid", WIFI_SSID);
     bool wOk = connectWiFi();
     if (wOk) { conKV("ip", WiFi.localIP().toString().c_str()); conKVf("rssi", "%d dBm", WiFi.RSSI()); }
-    else        conKV("error", "no link", COL_ERR);
+    else        conKV("error", "reintentando...", COL_ERR);
     conStatus(wOk);
-    if (!wOk) { delay(2500); return; }
+    if (!wOk) {
+        // No abandonamos: entramos al loop de reconexión
+        delay(800);
+        reconnectWiFi();
+        return;  // reconnectWiFi llama redrawAll, setup termina aquí
+    }
 
     // ---- Clima 3 ciudades ----
     for (uint8_t i = 0; i < 3; i++) {
@@ -510,10 +582,17 @@ void setup() {
 }
 
 void loop() {
-    if (!wifiOk) return;
     uint32_t now = millis();
 
-    // Cambio de ciudad
+    // --- Chequeo WiFi: si se cayó, entrar al loop de reconexión ---
+    if (WiFi.status() != WL_CONNECTED) {
+        wifiOk = false;
+        Serial.println("[WiFi] conexión perdida");
+        reconnectWiFi();
+        return;
+    }
+
+    // --- Cambio de ciudad ---
     if (now - lastCitySwitch >= CITY_SWITCH_MS) {
         lastCitySwitch = now;
         cityIdx = (cityIdx + 1) % 3;
@@ -522,14 +601,23 @@ void loop() {
         Serial.printf("Ciudad: %s\n", CITIES[cityIdx].name);
     }
 
-    // Reloj cada 250ms
+    // --- Reloj cada 250ms ---
     static uint32_t lastTick = 0;
     if (now - lastTick >= 250) { lastTick = now; renderClock(); }
 
-    // Fetch Open-Meteo si TTL expiró — redibuja solo si fue exitoso
+    // --- Fetch clima: TTL normal si válido, reintento rápido si no ---
     Weather& w = cityWeather[cityIdx];
-    if (w.valid && (now - w.lastFetchMs) > WEATHER_TTL) {
-        Serial.printf("Refresh %s...\n", CITIES[cityIdx].name);
-        if (fetchWeather(cityIdx)) drawWxPanel();
+    uint32_t retryMs  = w.valid ? WEATHER_TTL : WEATHER_RETRY_MS;
+    uint32_t sinceMs  = now - w.lastAttemptMs;
+    if (sinceMs > retryMs) {
+        Serial.printf("%s %s...\n", w.valid ? "Refresh" : "Retry", CITIES[cityIdx].name);
+        if (fetchWeather(cityIdx)) {
+            clearStatusBar();
+            drawWxPanel();
+        } else {
+            char msg[40];
+            snprintf(msg, sizeof(msg), "Sin datos clima - retry %lus", WEATHER_RETRY_MS/1000);
+            showStatusBar(msg, COL_ERR);
+        }
     }
 }
